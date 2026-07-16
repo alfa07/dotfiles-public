@@ -1,0 +1,21 @@
+{
+  verbs: [
+    {
+      invocation: terminal
+      key: enter
+      execution: ":print_path"
+      apply_to: file
+    }
+  ]
+
+  special_paths: {
+    ".github": enter
+    "/Users/maxim/.config": no-hide
+  }
+
+  syntax_theme: SolarizedLight
+
+  imports: [
+    solarized-light.hjson
+  ]
+}

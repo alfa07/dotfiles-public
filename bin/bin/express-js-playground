@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_DIR="${PLAYGROUNDS_DIR}/express-${TIMESTAMP}"
+
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+mkdir -p src
+
+
+# Initialize npm project and install dependencies
+npm init -y
+npm install express @prisma/client
+npm install -D typescript @types/node @types/express ts-node-dev prisma
+
+# Initialize TypeScript configuration
+npx tsc --init
+
+# Initialize Prisma
+npx prisma init --datasource-provider sqlite
+
+# Create Prisma schema
+cat > prisma/schema.prisma <<EOF
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  apiKeys   ApiKey[]
+}
+
+model ApiKey {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+EOF
+
+# Create main application file
+cat > src/index.ts <<EOF
+import express from 'express';
+import { PrismaClient } from '@prisma/client';
+
+const app = express();
+const prisma = new PrismaClient();
+
+app.use(express.json());
+
+// User CRUD operations
+app.post('/users', async (req, res) => {
+  const { email, name } = req.body;
+  const user = await prisma.user.create({
+    data: { email, name },
+  });
+  res.json(user);
+});
+
+app.get('/users', async (req, res) => {
+  const users = await prisma.user.findMany();
+  res.json(users);
+});
+
+app.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const user = await prisma.user.findUnique({
+    where: { id: Number(id) },
+  });
+  res.json(user);
+});
+
+app.put('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { email, name } = req.body;
+  const user = await prisma.user.update({
+    where: { id: Number(id) },
+    data: { email, name },
+  });
+  res.json(user);
+});
+
+app.delete('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  await prisma.user.delete({
+    where: { id: Number(id) },
+  });
+  res.json({ message: 'User deleted' });
+});
+
+// ApiKey CRUD operations
+app.post('/api-keys', async (req, res) => {
+  const { userId, key } = req.body;
+  const apiKey = await prisma.apiKey.create({
+    data: { userId: Number(userId), key },
+  });
+  res.json(apiKey);
+});
+
+app.get('/api-keys', async (req, res) => {
+  const apiKeys = await prisma.apiKey.findMany();
+  res.json(apiKeys);
+});
+
+app.get('/api-keys/:id', async (req, res) => {
+  const { id } = req.params;
+  const apiKey = await prisma.apiKey.findUnique({
+    where: { id: Number(id) },
+  });
+  res.json(apiKey);
+});
+
+app.put('/api-keys/:id', async (req, res) => {
+  const { id } = req.params;
+  const { key } = req.body;
+  const apiKey = await prisma.apiKey.update({
+    where: { id: Number(id) },
+    data: { key },
+  });
+  res.json(apiKey);
+});
+
+app.delete('/api-keys/:id', async (req, res) => {
+  const { id } = req.params;
+  await prisma.apiKey.delete({
+    where: { id: Number(id) },
+  });
+  res.json({ message: 'API Key deleted' });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(\`Server running on port \${PORT}\`);
+});
+EOF
+
+# Update package.json scripts
+npm pkg set scripts.start="ts-node-dev src/index.ts"
+npm pkg set scripts.build="tsc"
+npm pkg set scripts.migrate="prisma migrate dev"
+
+# Create a README with instructions
+cat > README.md <<EOF
+# Express.js API with Prisma and SQLite
+
+This project sets up an Express.js API server using Prisma ORM and SQLite database.
+
+## Setup
+
+1. Install dependencies:
+   \`\`\`
+   npm install
+   \`\`\`
+
+2. Generate and apply database migrations:
+   \`\`\`
+   npm run migrate
+   \`\`\`
+
+3. Start the development server:
+   \`\`\`
+   npm start
+   \`\`\`
+
+## Database Migrations
+
+To generate and apply new migrations after changing the Prisma schema:
+
+1. Make your changes to \`prisma/schema.prisma\`
+2. Run:
+   \`\`\`
+   npm run migrate
+   \`\`\`
+
+This will create a new migration, apply it to your database, and update the Prisma client.
+
+EOF
+
+# Setup tmux session
+# tmux new-window \; \
+#   rename-window "express-playground" \; \
+#   send-keys "nvim ./src/index.ts" C-m \; \
+#   split-window -h \; \
+#   send-keys "npm start" C-m \; \
+#   split-window -v \; \
+#   send-keys "npm run migrate" C-m \; \
+#   select-pane -L
+
+echo "Express.js playground setup complete. Project directory: $PROJECT_DIR"
+echo "To start the server, run 'npm start' in the project directory."
+echo "Remember to run 'npm run migrate' to apply database migrations."

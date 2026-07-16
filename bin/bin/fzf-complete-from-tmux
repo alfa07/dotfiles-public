@@ -1,0 +1,6 @@
+#!/bin/bash
+tmux capture-pane -pS -100 |            # Dump the tmux buffer.
+  tail -r |                             # Reverse so duplicates use the first match.
+  rg -o "[\\w\\d_\\-\\.\\/]+" |         # Extract the words using rg.
+  awk '{ if (!seen[$0]++) print }' |    # De-duplicate them with awk, then pass to fzf.
+  fzf --height=40% --no-sort --exact +i # Pass to fzf for completion.

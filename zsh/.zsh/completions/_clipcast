@@ -1,0 +1,155 @@
+#compdef clipcast
+
+autoload -U is-at-least
+
+_clipcast() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_clipcast_commands" \
+"*::: :->clipcast" \
+&& ret=0
+    case $state in
+    (clipcast)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:clipcast-command-$line[1]:"
+        case $line[1] in
+            (server)
+_arguments "${_arguments_options[@]}" : \
+'--write-clipboard-cmd=[Command to write to clipboard]:WRITE_CLIPBOARD_CMD:_default' \
+'--read-clipboard-cmd=[Command to read from clipboard]:READ_CLIPBOARD_CMD:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(client)
+_arguments "${_arguments_options[@]}" : \
+'--host=[SSH host to connect to]:HOST:_default' \
+'--write-clipboard-cmd=[Command to write to clipboard]:WRITE_CLIPBOARD_CMD:_default' \
+'--read-clipboard-cmd=[Command to read from clipboard]:READ_CLIPBOARD_CMD:_default' \
+'--remote-server-cmd=[]:REMOTE_SERVER_CMD:_default' \
+'--remote-write-clipboard-cmd=[Remote command to write to clipboard]:REMOTE_WRITE_CLIPBOARD_CMD:_default' \
+'--remote-read-clipboard-cmd=[Remote command to read from clipboard]:REMOTE_READ_CLIPBOARD_CMD:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(generate)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Generate shell completion script:(complete-bash complete-zsh complete-fish)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_clipcast__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:clipcast-help-command-$line[1]:"
+        case $line[1] in
+            (server)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(client)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(generate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_clipcast_commands] )) ||
+_clipcast_commands() {
+    local commands; commands=(
+'server:' \
+'client:' \
+'generate:' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'clipcast commands' commands "$@"
+}
+(( $+functions[_clipcast__client_commands] )) ||
+_clipcast__client_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast client commands' commands "$@"
+}
+(( $+functions[_clipcast__generate_commands] )) ||
+_clipcast__generate_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast generate commands' commands "$@"
+}
+(( $+functions[_clipcast__help_commands] )) ||
+_clipcast__help_commands() {
+    local commands; commands=(
+'server:' \
+'client:' \
+'generate:' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'clipcast help commands' commands "$@"
+}
+(( $+functions[_clipcast__help__client_commands] )) ||
+_clipcast__help__client_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast help client commands' commands "$@"
+}
+(( $+functions[_clipcast__help__generate_commands] )) ||
+_clipcast__help__generate_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast help generate commands' commands "$@"
+}
+(( $+functions[_clipcast__help__help_commands] )) ||
+_clipcast__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast help help commands' commands "$@"
+}
+(( $+functions[_clipcast__help__server_commands] )) ||
+_clipcast__help__server_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast help server commands' commands "$@"
+}
+(( $+functions[_clipcast__server_commands] )) ||
+_clipcast__server_commands() {
+    local commands; commands=()
+    _describe -t commands 'clipcast server commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_clipcast" ]; then
+    _clipcast "$@"
+else
+    compdef _clipcast clipcast
+fi

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_DIR="${PLAYGROUNDS_DIR}/flask-${TIMESTAMP}"
+
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install flask flask-sqlalchemy flask-migrate flask-cors
+
+# Create app structure
+mkdir app
+touch app/__init__.py app/models.py app/routes.py
+touch config.py
+
+# Create main app file
+cat > app/__init__.py <<EOF
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from flask_cors import CORS
+from config import Config
+
+db = SQLAlchemy()
+migrate = Migrate()
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+
+    db.init_app(app)
+    migrate.init_app(app, db)
+    CORS(app)
+
+    from app import routes
+    app.register_blueprint(routes.bp)
+
+    return app
+EOF
+
+# Create config file
+cat > config.py <<EOF
+import os
+
+class Config:
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///' + os.path.join(os.path.abspath(os.path.dirname(__file__)), 'app.db')
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+EOF
+
+# Create models file
+cat > app/models.py <<EOF
+from app import db
+from datetime import datetime
+
+class ApiKey(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(64), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True)
+
+    def __repr__(self):
+        return f'<ApiKey {self.key}>'
+EOF
+
+# Create routes file
+cat > app/routes.py <<EOF
+from flask import Blueprint, jsonify, request
+from app import db
+from app.models import ApiKey
+
+bp = Blueprint('main', __name__)
+
+@bp.route('/api/keys', methods=['GET'])
+def get_keys():
+    keys = ApiKey.query.all()
+    return jsonify([{'id': k.id, 'key': k.key, 'is_active': k.is_active} for k in keys])
+
+@bp.route('/api/keys', methods=['POST'])
+def create_key():
+    data = request.json
+    new_key = ApiKey(key=data['key'])
+    db.session.add(new_key)
+    db.session.commit()
+    return jsonify({'id': new_key.id, 'key': new_key.key, 'is_active': new_key.is_active}), 201
+
+@bp.route('/api/keys/<int:key_id>', methods=['PUT'])
+def update_key(key_id):
+    key = ApiKey.query.get_or_404(key_id)
+    data = request.json
+    key.is_active = data.get('is_active', key.is_active)
+    db.session.commit()
+    return jsonify({'id': key.id, 'key': key.key, 'is_active': key.is_active})
+
+@bp.route('/api/keys/<int:key_id>', methods=['DELETE'])
+def delete_key(key_id):
+    key = ApiKey.query.get_or_404(key_id)
+    db.session.delete(key)
+    db.session.commit()
+    return '', 204
+EOF
+
+# Create main run file
+cat > run.py <<EOF
+from app import create_app, db
+
+app = create_app()
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
+EOF
+
+# Initialize database
+flask db init
+flask db migrate -m "Initial migration"
+flask db upgrade
+
+# Create a README file
+cat > README.md <<EOF
+# Flask Playground
+
+This is a Flask playground with SQLAlchemy, Alembic, and CORS configuration.
+
+## Setup
+
+1. Activate the virtual environment:
+   \`\`\`
+   source venv/bin/activate
+   \`\`\`
+
+2. Run the application:
+   \`\`\`
+   python run.py
+   \`\`\`
+
+## API Endpoints
+
+- GET /api/keys: List all API keys
+- POST /api/keys: Create a new API key
+- PUT /api/keys/<key_id>: Update an API key
+- DELETE /api/keys/<key_id>: Delete an API key
+EOF
+
+echo "Flask playground setup complete. Navigate to $PROJECT_DIR and run 'python run.py' to start the server."

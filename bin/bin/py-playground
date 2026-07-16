@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_DIR="${PLAYGROUNDS_DIR}/py-${TIMESTAMP}"
+
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+cat >main.py <<EOF
+import re
+from collections import defaultdict
+
+def main():
+	print("hello")
+
+if __name__ == '__main__':
+	main()
+EOF
+
+python3 -mvenv venv
+source venv/bin/activate
+pip install black isort
+
+if [[ "$#" != 0 ]]; then
+  pip install "$@"
+fi
+
+tmux new-window \; \
+  rename-window "playground" \; \
+  send-keys " " C-m \; \
+  send-keys " source venv/bin/activate; nvim ./main.py" C-m \; \
+  split-window -h \; \
+  send-keys " " C-m \; \
+  send-keys " source venv/bin/activate; watchexec -e py -r 'clear && python main.py'" C-m \; \
+  split-window -v \; \
+  send-keys " " C-m \; \
+  send-keys " source venv/bin/activate" C-m \; \
+  select-pane -L

@@ -1,0 +1,12 @@
+# To reload press Cmd-Shift-,
+theme = iTerm2 Solarized Light
+font-family = Iosevka Nerd Font
+font-size = 18
+window-colorspace = display-p3
+keybind = global:cmd+alt+grave_accent=toggle_quick_terminal
+bell-features = audio,attention,title
+bell-audio-path = /System/Library/Sounds/Glass.aiff
+bell-audio-volume = 1.0
+
+desktop-notifications = true
+

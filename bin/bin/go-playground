@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_DIR="${PLAYGROUNDS_DIR}/go-${TIMESTAMP}"
+
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Initialize Go module
+go mod init playground
+
+# Create main.go with basic template
+cat >main.go <<EOF
+package main
+
+import (
+	"fmt"
+)
+
+func main() {
+	fmt.Println("Hello, Go!")
+}
+EOF
+
+# Install development tools
+go install golang.org/x/tools/cmd/goimports@latest
+go install github.com/air-verse/air@latest
+
+# Create air configuration for hot reloading
+cat >.air.toml <<EOF
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/main ."
+bin = "./tmp/main"
+include_ext = ["go"]
+exclude_dir = ["tmp"]
+delay = 1000
+
+[screen]
+clear_on_rebuild = true
+EOF
+
+# Install additional dependencies if provided
+if [[ "$#" != 0 ]]; then
+  for dep in "$@"; do
+    go get "$dep"
+  done
+fi
+
+# Setup tmux with three panes:
+# 1. Editor (nvim)
+# 2. Hot reload with air
+# 3. Interactive Go shell
+tmux new-window \; \
+  rename-window "go-playground" \; \
+  send-keys "clear" C-m \; \
+  send-keys "nvim ./main.go" C-m \; \
+  split-window -h \; \
+  send-keys "clear" C-m \; \
+  send-keys "air" C-m \; \
+  split-window -v \; \
+  send-keys "clear" C-m \; \
+  select-pane -L

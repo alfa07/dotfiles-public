@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_NAME="rust"
+DEPS=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --name)
+    PROJECT_NAME="$2"
+    shift 2
+    ;;
+  --deps)
+    DEPS="$2"
+    shift 2
+    ;;
+  *)
+    echo "Unknown option: $1"
+    exit 1
+    ;;
+  esac
+done
+
+PROJECT_DIR="${PLAYGROUNDS_DIR}/${PROJECT_NAME}-${TIMESTAMP}"
+
+cargo new --bin "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Create rustfmt.toml
+cat >rustfmt.toml <<EOF
+max_width = 80
+EOF
+
+# Initialize bacon config
+bacon --init
+
+# Add dependencies if specified
+if [[ -n "$DEPS" ]]; then
+  IFS=':' read -ra DEP_ARRAY <<<"$DEPS"
+  for dep in "${DEP_ARRAY[@]}"; do
+    IFS=',' read -r crate features <<<"$dep"
+    if [[ -n "$features" ]]; then
+      cargo add "$crate" -F "$features"
+    else
+      cargo add "$crate"
+    fi
+  done
+fi
+
+tmux new-window \; \
+  rename-window "$PROJECT_NAME" \; \
+  send-keys " " C-m \; \
+  send-keys "nvim ./src/main.rs" C-m \; \
+  split-window -h \; \
+  send-keys " " C-m \; \
+  send-keys "bacon" C-m \; \
+  select-pane -L

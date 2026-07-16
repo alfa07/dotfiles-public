@@ -1,0 +1,176 @@
+#!/bin/bash
+
+# set -x
+# set -e
+
+# s3-finder.sh - Find S3 buckets in codebase
+# Usage: ./s3-finder.sh [directory]
+
+# Default search directory is current directory if not specified
+
+# Display help information
+function show_help {
+  echo "S3 Bucket Finder - Search codebase for S3 bucket references"
+  echo "Usage: ./s3-finder.sh [OPTIONS] [DIRECTORY]"
+  echo ""
+  echo "Options:"
+  echo "  -h, --help         Show this help message"
+  echo "  -v, --verbose      Show more detailed results including line numbers"
+  echo "  -j, --json         Only search in JSON files"
+  echo "  -y, --yaml         Only search in YAML files"
+  echo "  -a, --all          Search all files (default)"
+  echo "  -b, --buckets-only Extract and show only bucket names"
+  echo "  -m, --vim          Output in Vim-compatible format (filename:line:match)"
+  echo ""
+  echo "Examples:"
+  echo "  ./s3-finder.sh                    # Search in current directory"
+  echo "  ./s3-finder.sh -v ./src           # Verbose search in src directory"
+  echo "  ./s3-finder.sh -j ./config        # Search only JSON files in config directory"
+  echo "  ./s3-finder.sh -b                 # Show only bucket names found"
+  echo "  ./s3-finder.sh -m                 # Output in Vim-compatible format"
+  exit 0
+}
+
+# Set default options
+VERBOSE=false
+FILE_FILTER=""
+BUCKETS_ONLY=false
+VIM_FORMAT=false
+
+SEARCH_DIR="."
+
+# Process command line arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  -h | --help)
+    show_help
+    ;;
+  -v | --verbose)
+    VERBOSE=true
+    shift
+    ;;
+  -j | --json)
+    FILE_FILTER="--type json"
+    shift
+    ;;
+  -y | --yaml)
+    FILE_FILTER="--type yaml"
+    shift
+    ;;
+  -a | --all)
+    FILE_FILTER=""
+    shift
+    ;;
+  -b | --buckets-only)
+    BUCKETS_ONLY=true
+    shift
+    ;;
+  -m | --vim)
+    VIM_FORMAT=true
+    shift
+    ;;
+  *)
+    SEARCH_DIR="$1"
+    shift
+    ;;
+  esac
+done
+
+# Display banner (unless buckets-only mode or vim mode)
+if [ "$BUCKETS_ONLY" = false ] && [ "$VIM_FORMAT" = false ]; then
+  echo "==================================================="
+  echo "S3 Bucket Finder - Searching in: $SEARCH_DIR"
+  echo "==================================================="
+fi
+
+# Common S3 bucket patterns
+S3_PATTERNS=(
+  # Common S3 bucket declarations/references
+  "s3://([a-zA-Z0-9][a-zA-Z0-9.-]+)"
+  "bucket[\":]\\s*[\"']([a-zA-Z0-9][a-zA-Z0-9.-]+)[\"']"
+  "bucket_name[\":]\\s*[\"']([a-zA-Z0-9][a-zA-Z0-9.-]+)[\"']"
+  "aws_s3_bucket\\.([a-zA-Z0-9_]+)\\b"
+  "AWS::S3::Bucket.*[\":]\\s*[\"']?([a-zA-Z0-9][a-zA-Z0-9.-]+)[\"']?"
+  # ARNs
+  "arn:aws:s3:::([a-zA-Z0-9][a-zA-Z0-9.-]+)"
+)
+
+# Special handling for buckets-only mode
+if [ "$BUCKETS_ONLY" = true ]; then
+  # Use PCRE2 for capture groups
+  RG_OPTS="--color never -P --only-matching"
+
+  # Array to store unique bucket names
+  declare -A FOUND_BUCKETS
+
+  for pattern in "${S3_PATTERNS[@]}"; do
+    if [ -z "$FILE_FILTER" ]; then
+      RESULTS=$(rg $RG_OPTS "$pattern" "$SEARCH_DIR" | grep -o -E '[a-zA-Z0-9][a-zA-Z0-9.-]+' || true)
+    else
+      RESULTS=$(rg $RG_OPTS $FILE_FILTER "$pattern" "$SEARCH_DIR" | grep -o -E '[a-zA-Z0-9][a-zA-Z0-9.-]+' || true)
+    fi
+
+    # Add results to our array for deduplication
+    if [ ! -z "$RESULTS" ]; then
+      while IFS= read -r bucket; do
+        FOUND_BUCKETS["$bucket"]=1
+      done <<<"$RESULTS"
+    fi
+  done
+
+  # Output unique bucket names
+  if [ ${#FOUND_BUCKETS[@]} -eq 0 ]; then
+    echo "No S3 buckets found."
+  else
+    echo "Found ${#FOUND_BUCKETS[@]} unique S3 buckets:"
+    for bucket in "${!FOUND_BUCKETS[@]}"; do
+      echo "$bucket"
+    done
+  fi
+
+  exit 0
+fi
+
+# Set up search configuration for Vim format
+if [ "$VIM_FORMAT" = true ]; then
+  # Vim format: filename:line:column:match
+  RG_OPTS="--color never --vimgrep"
+
+  # Execute a single ripgrep command with all patterns combined with OR
+  COMBINED_PATTERN=$(
+    IFS="|"
+    echo "${S3_PATTERNS[*]}"
+  )
+
+  if [ -z "$FILE_FILTER" ]; then
+    rg $RG_OPTS -P "$COMBINED_PATTERN" "$SEARCH_DIR" || echo "No matches found"
+  else
+    rg $RG_OPTS -P $FILE_FILTER "$COMBINED_PATTERN" "$SEARCH_DIR" || echo "No matches found"
+  fi
+
+  exit 0
+fi
+
+# Regular search mode
+echo "Searching for S3 bucket references..."
+echo ""
+
+# Search configuration for regular mode
+RG_OPTS="--color always"
+[ "$VERBOSE" = true ] && RG_OPTS="$RG_OPTS -n" || RG_OPTS="$RG_OPTS -l"
+
+for pattern in "${S3_PATTERNS[@]}"; do
+  echo "Pattern: $pattern"
+  echo "-----------------"
+
+  # Execute ripgrep with the pattern
+  if [ -z "$FILE_FILTER" ]; then
+    rg $RG_OPTS "$pattern" "$SEARCH_DIR" || echo "No matches found"
+  else
+    rg $RG_OPTS $FILE_FILTER "$pattern" "$SEARCH_DIR" || echo "No matches found"
+  fi
+
+  echo ""
+done
+
+echo "Search complete."

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+# Exit on any error
+set -e
+
+# Function to check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Function to cleanup and delete droplet
+cleanup() {
+    if [ "$KEEP_DROPLET" = false ] && [ -n "$DROPLET_ID" ]; then
+        echo "Cleaning up and deleting droplet..."
+        doctl compute droplet delete $DROPLET_ID -f
+    elif [ "$KEEP_DROPLET" = true ] && [ -n "$DROPLET_ID" ]; then
+        echo "Keeping droplet alive. Droplet ID: $DROPLET_ID"
+        echo "To delete it later, use: doctl compute droplet delete $DROPLET_ID"
+    fi
+    exit
+}
+
+# Set trap for cleanup on exit, including errors and Ctrl-C
+trap cleanup EXIT INT TERM
+
+# Check for required commands
+for cmd in doctl jq git; do
+    if ! command_exists $cmd; then
+        echo "$cmd is not installed. Please install it first."
+        exit 1
+    fi
+done
+
+# Ensure doctl is authenticated
+if ! doctl account get >/dev/null 2>&1; then
+    echo "Please authenticate doctl with 'doctl auth init' before running this script."
+    exit 1
+fi
+
+# Parse arguments
+PROJECTS=()
+CMD=""
+WORKDIR=""
+KEEP_DROPLET=false
+
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        -p|--project)
+            PROJECTS+=("$2")
+            shift
+            shift
+            ;;
+        --cmd)
+            CMD="$2"
+            shift
+            shift
+            ;;
+        --workdir)
+            WORKDIR="$2"
+            shift
+            shift
+            ;;
+        --keep-droplet)
+            KEEP_DROPLET=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+get_current_repo_url() {
+    git config --get remote.origin.url
+}
+
+if [ ${#PROJECTS[@]} -eq 0 ]; then
+    CURRENT_REPO=$(get_current_repo_url)
+    if [ -z "$CURRENT_REPO" ]; then
+        echo "No projects specified and not in a git repository. Use -p or --project to specify GitHub repository links."
+        exit 1
+    fi
+    PROJECTS+=("$CURRENT_REPO")
+    echo "No project specified. Using current repository: $CURRENT_REPO"
+fi
+
+if [ -z "$CMD" ]; then
+    CMD="cargo bench"
+fi
+
+if [ -z "$WORKDIR" ]; then
+    WORKDIR="/code/$(basename ${PROJECTS[0]} .git)"
+fi
+
+# Create droplet
+echo "Creating droplet..."
+DROPLET_INFO=$(doctl compute droplet create benchmark-droplet \
+    --image 163711012 \
+    --size s-4vcpu-8gb \
+    --region sfo3 \
+    --ssh-keys $(doctl compute ssh-key list --format ID --no-header) \
+    --format ID,PublicIPv4 \
+    --no-header)
+
+DROPLET_ID=$(echo $DROPLET_INFO | awk '{print $1}')
+
+echo "Droplet created with ID: $DROPLET_ID"
+
+# Wait for droplet to be active
+echo "Waiting for droplet to become active..."
+while [[ $(doctl compute droplet get $DROPLET_ID --format Status --no-header) != "active" ]]; do
+    sleep 5
+done
+
+# Get droplet IP
+IP=$(doctl compute droplet get $DROPLET_ID --format PublicIPv4 --no-header)
+echo "Droplet IP: $IP"
+
+# Wait for SSH to be available
+echo "Waiting for SSH to become available..."
+while ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$IP echo ready 2>/dev/null
+do
+    sleep 5
+done
+
+# Setup environment and run benchmark
+echo "Setting up environment and running benchmark..."
+ssh -o StrictHostKeyChecking=no -A root@$IP << EOF
+    # Create code directory
+    mkdir -p /code
+    cd /code
+
+    # Clone all projects
+    $(for project in "${PROJECTS[@]}"; do
+        echo "GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git clone $project"
+    done)
+
+    # Run the command in the specified workdir
+    cd $WORKDIR
+    $CMD
+EOF
+
+echo "Benchmark complete."
+
+if [ "$KEEP_DROPLET" = true ]; then
+    echo "Droplet is being kept alive. To access it later:"
+    echo "ssh root@$IP"
+    echo "To delete it when you're done:"
+    echo "doctl compute droplet delete $DROPLET_ID"
+fi

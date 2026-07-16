@@ -1,0 +1,1923 @@
+#!/usr/bin/env rust-script
+
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5", features = ["derive"] }
+//! ratatui = "0.28"
+//! crossterm = "0.28"
+//! tokio = { version = "1", features = ["full"] }
+//! serde = { version = "1", features = ["derive"] }
+//! serde_json = "1"
+//! anyhow = "1"
+//! dirs = "5"
+//! pathdiff = "0.2"
+//! skim = "0.10"
+//! indicatif = "0.17"
+//! ```
+
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Frame, Terminal,
+};
+use indicatif::ProgressBar;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+
+#[derive(Parser)]
+#[command(name = "ft")]
+#[command(about = "Git feature-clone (and legacy worktree) management tool", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    #[command(about = "Create a feature clone and launch Claude Code in tmux")]
+    New {
+        #[arg(help = "Feature branch name")]
+        feature: String,
+    },
+    #[command(about = "Interactive cleanup of landed feature clones/worktrees")]
+    Clean,
+    #[command(about = "Switch to tmux window for feature branch")]
+    Go {
+        #[arg(help = "Feature branch name (optional - shows fuzzy finder if omitted)")]
+        feature: Option<String>,
+    },
+    #[command(about = "Recreate tmux windows for features that lack one")]
+    Restore,
+    #[command(about = "Delete local branches that are merged into main or whose upstream is gone")]
+    CleanStaleBranches {
+        #[arg(long, help = "Skip git fetch --all --prune before classifying")]
+        no_fetch: bool,
+        #[arg(long, short = 'y', help = "Skip the y/N confirmation prompt")]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeatureKind {
+    Worktree,
+    Clone,
+}
+
+impl FeatureKind {
+    fn label(self) -> &'static str {
+        match self {
+            FeatureKind::Worktree => "worktree",
+            FeatureKind::Clone => "clone",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Feature {
+    path: PathBuf,
+    kind: FeatureKind,
+    branch: String,
+    commit: String,
+    is_current: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FeatureStatus {
+    uncommitted_count: usize,
+    _files_changed: usize,
+    insertions: usize,
+    deletions: usize,
+    is_landed: bool,
+    pr_info: Option<PrInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrInfo {
+    number: u32,
+    url: String,
+    ci_status: CiStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CiStatus {
+    Success,
+    Failure,
+    Pending,
+    None,
+}
+
+#[derive(Debug, Clone)]
+struct TmuxWindow {
+    session: String,
+    window_index: String,
+    window_id: String,
+    name: String,
+    path: PathBuf,
+    ft_worktree: Option<String>,
+}
+
+struct CleanupItem {
+    feature: Feature,
+    status: FeatureStatus,
+    selected: bool,
+    tmux_windows: Vec<TmuxWindow>,
+    has_open_window: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BranchInfo {
+    name: String,
+    track: String,
+    worktree_path: String,
+    subject: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StaleReason {
+    Gone,
+    Merged,
+    GoneAndMerged,
+}
+
+impl StaleReason {
+    fn label(self) -> &'static str {
+        match self {
+            StaleReason::Gone => "gone",
+            StaleReason::Merged => "merged",
+            StaleReason::GoneAndMerged => "gone+merged",
+        }
+    }
+
+    fn force(self) -> bool {
+        matches!(self, StaleReason::Gone | StaleReason::GoneAndMerged)
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::New { feature } => cmd_new(&feature).await,
+        Commands::Clean => cmd_clean().await,
+        Commands::Go { feature } => cmd_go(&feature).await,
+        Commands::Restore => cmd_restore().await,
+        Commands::CleanStaleBranches { no_fetch, yes } => {
+            cmd_clean_stale_branches(no_fetch, yes).await
+        }
+    }
+}
+
+async fn cmd_new(feature: &str) -> Result<()> {
+    let main_repo = find_main_repo().await?;
+    println!("Main repository: {}", main_repo.display());
+
+    if let Err(e) = fetch_origin(&main_repo).await {
+        eprintln!("Warning: Failed to fetch from origin: {}", e);
+    }
+
+    let main_branch = get_main_branch(&main_repo).await?;
+    println!("Main branch: {}", main_branch);
+
+    let feature_path = main_repo.join(".wt").join(feature);
+
+    let existing_features = list_features(&main_repo).await?;
+    let feature_exists = existing_features
+        .iter()
+        .any(|f| f.path == feature_path);
+
+    let is_inside_tmux = std::env::var("TMUX").is_ok();
+
+    if feature_exists {
+        println!("Feature already exists at {}", feature_path.display());
+
+        if is_inside_tmux {
+            let windows = list_tmux_windows().await?;
+            let window_exists = windows.iter().any(|w| w.name == feature);
+
+            if window_exists {
+                println!("Switching to existing tmux window: {}", feature);
+                tmux_select_window(feature).await?;
+                return Ok(());
+            }
+        } else {
+            let session_exists = tmux_has_session(feature).await?;
+            if session_exists {
+                println!("Attaching to existing tmux session: {}", feature);
+                tmux_attach_session(feature).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        std::fs::create_dir_all(main_repo.join(".wt"))
+            .context("Failed to create .wt directory")?;
+
+        create_feature_clone(&main_repo, &feature_path, feature, &main_branch).await?;
+    }
+
+    ensure_gitignore_entries(&main_repo).await?;
+
+    setup_cargo_config(&feature_path, &main_repo, feature).await?;
+
+    if is_inside_tmux {
+        let current_session = tmux_current_session().await?;
+        tmux_new_window(feature, &feature_path).await?;
+        tmux_send_keys(&format!("{}:{}", current_session, feature), "claude --dangerously-skip-permissions").await?;
+    } else {
+        tmux_new_session(feature, &feature_path).await?;
+        tmux_send_keys(&format!("{}:0", feature), "claude --dangerously-skip-permissions").await?;
+        tmux_attach_session(feature).await?;
+    }
+
+    Ok(())
+}
+
+async fn create_feature_clone(
+    main_repo: &Path,
+    feature_path: &Path,
+    feature: &str,
+    main_branch: &str,
+) -> Result<()> {
+    let origin_url = git_remote_url(main_repo, "origin").await.with_context(|| {
+        "Main repository has no `origin` remote — `ft` clone mode requires an origin URL"
+    })?;
+
+    println!("Cloning {} into {}", origin_url, feature_path.display());
+
+    let use_reference = std::env::var("FT_NO_REFERENCE").ok().as_deref() != Some("1");
+
+    let main_repo_str = main_repo.to_string_lossy().to_string();
+    let feature_path_str = feature_path.to_string_lossy().to_string();
+
+    let mut clone_args: Vec<&str> = vec![
+        "clone",
+        "--filter=blob:none",
+        "--no-checkout",
+    ];
+    if use_reference {
+        clone_args.push("--reference-if-able");
+        clone_args.push(&main_repo_str);
+    }
+    clone_args.push(&origin_url);
+    clone_args.push(&feature_path_str);
+
+    run_command(main_repo, "git", &clone_args).await?;
+
+    let main_repo_canon = std::fs::canonicalize(main_repo)
+        .unwrap_or_else(|_| main_repo.to_path_buf());
+    run_command(
+        feature_path,
+        "git",
+        &[
+            "config",
+            "--local",
+            "ft.mainRepo",
+            main_repo_canon.to_str().unwrap(),
+        ],
+    )
+    .await?;
+
+    for key in ["user.name", "user.email"] {
+        if let Some(value) = git_effective_config(main_repo, key).await? {
+            run_command(feature_path, "git", &["config", "--local", key, value.as_str()]).await?;
+        }
+    }
+
+    let _ = Command::new("git")
+        .current_dir(feature_path)
+        .arg("fetch")
+        .arg("origin")
+        .arg(main_branch)
+        .status()
+        .await;
+
+    if remote_branch_exists(feature_path, feature).await? {
+        println!("Checking out existing remote branch: {}", feature);
+        run_command(feature_path, "git", &["checkout", feature]).await?;
+    } else {
+        let start_point = format!("origin/{}", main_branch);
+        println!("Creating new branch {} from {}", feature, start_point);
+        run_command(
+            feature_path,
+            "git",
+            &["checkout", "--no-track", "-b", feature, &start_point],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn git_effective_config(repo: &Path, key: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("config")
+        .arg("--get")
+        .arg(key)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8(output.stdout)?.trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+async fn git_remote_url(repo: &Path, remote: &str) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("remote")
+        .arg("get-url")
+        .arg(remote)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(anyhow!("git remote get-url {} failed", remote));
+    }
+    let url = String::from_utf8(output.stdout)?.trim().to_string();
+    if url.is_empty() {
+        return Err(anyhow!("git remote get-url {} returned empty", remote));
+    }
+    Ok(url)
+}
+
+async fn remote_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("refs/remotes/origin/{}", branch))
+        .output()
+        .await?;
+    Ok(output.status.success())
+}
+
+async fn cmd_go(feature: &Option<String>) -> Result<()> {
+    let main_repo = find_main_repo().await?;
+    let features = list_features(&main_repo).await?;
+
+    let target = if feature.is_none() {
+        if features.is_empty() {
+            return Err(anyhow!("No features to switch to"));
+        }
+
+        let items: Vec<String> = features
+            .iter()
+            .map(|f| {
+                let branch = f.branch.strip_prefix("refs/heads/")
+                    .unwrap_or(&f.branch);
+                let marker = if f.is_current { " (current)" } else { "" };
+                format!("{}{}", branch, marker)
+            })
+            .collect();
+
+        let selected = run_fuzzy_finder(&items)?;
+
+        if selected.is_none() {
+            return Err(anyhow!("No feature selected"));
+        }
+
+        let selected_branch = selected.unwrap()
+            .trim_end_matches(" (current)")
+            .to_string();
+
+        features
+            .iter()
+            .find(|f| {
+                let branch = f.branch.strip_prefix("refs/heads/")
+                    .unwrap_or(&f.branch);
+                branch == selected_branch
+            })
+            .ok_or_else(|| anyhow!("Feature not found"))?
+    } else {
+        let feature_name = feature.as_ref().unwrap();
+        let matching: Vec<_> = features
+            .iter()
+            .filter(|f| {
+                let branch_name = f.branch.strip_prefix("refs/heads/").unwrap_or(&f.branch);
+                branch_name == feature_name || branch_name.contains(feature_name)
+            })
+            .collect();
+
+        match matching.len() {
+            0 => return Err(anyhow!("No feature found for: {}", feature_name)),
+            1 => matching[0],
+            _ => {
+                println!("Multiple matches found:");
+                for (i, f) in matching.iter().enumerate() {
+                    let branch_name = f.branch.strip_prefix("refs/heads/").unwrap_or(&f.branch);
+                    println!("  {}: {} ({})", i + 1, branch_name, f.path.display());
+                }
+                print!("Select (1-{}): ", matching.len());
+                io::Write::flush(&mut io::stdout())?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let choice: usize = input.trim().parse().context("Invalid selection")?;
+
+                matching.get(choice - 1)
+                    .ok_or_else(|| anyhow!("Selection out of range"))?
+            }
+        }
+    };
+
+    let branch_name = target.branch.strip_prefix("refs/heads/").unwrap_or(&target.branch);
+    setup_cargo_config(&target.path, &main_repo, branch_name).await?;
+    switch_to_feature_tmux(target, branch_name).await?;
+
+    Ok(())
+}
+
+fn run_fuzzy_finder(items: &[String]) -> Result<Option<String>> {
+    use skim::prelude::*;
+    use std::io::Cursor;
+
+    let options = SkimOptionsBuilder::default()
+        .height(Some("50%"))
+        .multi(false)
+        .prompt(Some("Select feature> "))
+        .build()
+        .unwrap();
+
+    let input = items.join("\n");
+    let item_reader = SkimItemReader::default();
+    let items = item_reader.of_bufread(Cursor::new(input));
+
+    let output = Skim::run_with(&options, Some(items));
+
+    match output {
+        Some(out) if !out.is_abort => {
+            let selected = out.selected_items
+                .first()
+                .map(|item| item.output().to_string());
+            Ok(selected)
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn switch_to_feature_tmux(feature: &Feature, branch_name: &str) -> Result<()> {
+    let is_inside_tmux = std::env::var("TMUX").is_ok();
+
+    if is_inside_tmux {
+        let windows = list_tmux_windows().await?;
+        let window_exists = windows.iter().any(|w| w.name == branch_name);
+
+        if window_exists {
+            tmux_select_window(branch_name).await?;
+        } else {
+            let current_session = tmux_current_session().await?;
+            tmux_new_window(branch_name, &feature.path).await?;
+            tmux_send_keys(
+                &format!("{}:{}", current_session, branch_name),
+                "claude --dangerously-skip-permissions"
+            ).await?;
+        }
+    } else {
+        let session_exists = tmux_has_session(branch_name).await?;
+        if session_exists {
+            tmux_attach_session(branch_name).await?;
+        } else {
+            tmux_new_session(branch_name, &feature.path).await?;
+            tmux_send_keys(
+                &format!("{}:0", branch_name),
+                "claude --dangerously-skip-permissions"
+            ).await?;
+            tmux_attach_session(branch_name).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_restore() -> Result<()> {
+    if std::env::var("TMUX").is_err() {
+        return Err(anyhow!("ft restore must be run inside a tmux session"));
+    }
+
+    let main_repo = find_main_repo().await?;
+    let features = list_features(&main_repo).await?;
+    let current_session = tmux_current_session().await?;
+
+    let mut restored = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut total = 0usize;
+
+    for f in &features {
+        let f_canon = match std::fs::canonicalize(&f.path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip  {}: cannot canonicalize ({})", f.path.display(), e);
+                continue;
+            }
+        };
+
+        if f.branch == "HEAD" {
+            eprintln!("skip  {}: detached HEAD", f.path.display());
+            continue;
+        }
+
+        total += 1;
+        let branch = f.branch.strip_prefix("refs/heads/").unwrap_or(&f.branch);
+
+        let existing = find_windows_for_feature(f).await?;
+        if !existing.is_empty() {
+            println!("skip  {} (window exists)", branch);
+            skipped += 1;
+            continue;
+        }
+
+        match tmux_new_window(branch, &f_canon).await {
+            Ok(()) => {
+                if let Err(e) = tmux_send_keys(
+                    &format!("{}:{}", current_session, branch),
+                    "claude --dangerously-skip-permissions --resume",
+                ).await {
+                    eprintln!("warn  {}: window created but send-keys failed: {}", branch, e);
+                }
+                println!("restore {}", branch);
+                restored += 1;
+            }
+            Err(e) => {
+                eprintln!("fail  {}: {}", branch, e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nRestored {}, skipped {}, failed {} of {} features",
+        restored, skipped, failed, total
+    );
+    Ok(())
+}
+
+async fn cmd_clean() -> Result<()> {
+    let main_repo = find_main_repo().await?;
+    let features = list_features(&main_repo).await?;
+
+    if features.is_empty() {
+        println!("No features to clean");
+        return Ok(());
+    }
+
+    let non_current: Vec<_> = features.iter().filter(|f| !f.is_current).cloned().collect();
+
+    if non_current.is_empty() {
+        println!("No features to clean (all features are currently in use)");
+        return Ok(());
+    }
+
+    let mut items = Vec::new();
+
+    let all_windows = list_tmux_windows().await.unwrap_or_default();
+
+    let total = non_current.len();
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    for (idx, feature) in non_current.into_iter().enumerate() {
+        let branch = feature
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&feature.branch)
+            .to_string();
+        pb.set_message(format!("[{}/{}] Analyzing {}", idx + 1, total, branch));
+
+        let status = get_feature_status(&feature, &main_repo).await?;
+        let tmux_windows = find_windows_for_feature(&feature).await?;
+
+        let name_match = feature
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| all_windows.iter().any(|w| w.name == name))
+            .unwrap_or(false);
+
+        let has_open_window = !tmux_windows.is_empty() || name_match;
+
+        let selected = status.is_landed
+            && status.uncommitted_count == 0
+            && !has_open_window;
+
+        items.push(CleanupItem {
+            feature,
+            status,
+            selected,
+            tmux_windows,
+            has_open_window,
+        });
+    }
+
+    pb.finish_and_clear();
+
+    items.sort_by_key(|i| i.selected);
+
+    let selected_items = run_cleanup_tui(items)?;
+
+    if selected_items.is_empty() {
+        println!("No features selected for deletion");
+        return Ok(());
+    }
+
+    println!("\nDelete {} feature(s)?", selected_items.len());
+    println!("\nFeatures:");
+    for item in &selected_items {
+        let branch_name = item.feature.branch.strip_prefix("refs/heads/").unwrap_or(&item.feature.branch);
+        println!("  - {} [{}]", branch_name, item.feature.kind.label());
+    }
+
+    let total_windows: usize = selected_items.iter().map(|i| i.tmux_windows.len()).sum();
+    if total_windows > 0 {
+        println!("\nTmux windows ({}):", total_windows);
+        for item in &selected_items {
+            for window in &item.tmux_windows {
+                println!("  - {}:{} \"{}\"", window.session, window.window_index, window.name);
+            }
+        }
+    }
+
+    print!("\nContinue? (y/N): ");
+    io::Write::flush(&mut io::stdout())?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("Cancelled");
+        return Ok(());
+    }
+
+    let mut deleted_features = 0;
+    let mut deleted_windows = 0;
+
+    for item in selected_items {
+        let branch_name = item.feature.branch.strip_prefix("refs/heads/").unwrap_or(&item.feature.branch);
+
+        for window in &item.tmux_windows {
+            let target = window.window_id.clone();
+            if let Err(e) = tmux_kill_window(&target).await {
+                eprintln!("Warning: Failed to kill tmux window {}: {}", target, e);
+            } else {
+                deleted_windows += 1;
+            }
+        }
+
+        print!("Removing {} [{}]... ", branch_name, item.feature.kind.label());
+        io::Write::flush(&mut io::stdout())?;
+
+        match remove_feature(&main_repo, &item.feature).await {
+            Ok(_) => {
+                println!("✓");
+                deleted_features += 1;
+            }
+            Err(e) => {
+                println!("✗ ({})", e);
+            }
+        }
+    }
+
+    println!("\nDeleted {} feature(s), closed {} tmux window(s)",
+        deleted_features, deleted_windows);
+
+    if let Err(e) = cmd_clean_stale_branches(false, false).await {
+        eprintln!("Warning: stale-branch cleanup failed: {}", e);
+    }
+
+    Ok(())
+}
+
+async fn find_main_repo() -> Result<PathBuf> {
+    let cfg = Command::new("git")
+        .arg("config")
+        .arg("--local")
+        .arg("--get")
+        .arg("ft.mainRepo")
+        .output()
+        .await;
+    if let Ok(out) = cfg {
+        if out.status.success() {
+            let path = String::from_utf8(out.stdout)?.trim().to_string();
+            if !path.is_empty() {
+                let pb = PathBuf::from(&path);
+                if pb.exists() {
+                    return Ok(std::fs::canonicalize(pb)?);
+                }
+                eprintln!(
+                    "Warning: ft.mainRepo config points to missing path: {}",
+                    path
+                );
+            }
+        }
+    }
+
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .await
+        .context("Failed to run git rev-parse")?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Not in a git repository"));
+    }
+
+    let git_common_dir = String::from_utf8(output.stdout)?.trim().to_string();
+    let git_common_path = PathBuf::from(&git_common_dir);
+
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .output()
+        .await?;
+
+    let git_dir = String::from_utf8(output.stdout)?.trim().to_string();
+    let gitdir_file = PathBuf::from(&git_dir).join("gitdir");
+
+    let main_repo = if gitdir_file.exists() {
+        git_common_path.parent()
+            .ok_or_else(|| anyhow!("Failed to get parent of git common dir"))?
+            .to_path_buf()
+    } else {
+        let output = Command::new("git")
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!("Failed to find git toplevel"));
+        }
+
+        PathBuf::from(String::from_utf8(output.stdout)?.trim())
+    };
+
+    Ok(std::fs::canonicalize(main_repo)?)
+}
+
+async fn list_features(main_repo: &Path) -> Result<Vec<Feature>> {
+    let mut features = Vec::new();
+
+    let wt_dir = main_repo.join(".wt");
+    let entries = match std::fs::read_dir(&wt_dir) {
+        Ok(e) => e,
+        Err(ref err) if err.kind() == io::ErrorKind::NotFound => return Ok(features),
+        Err(err) => return Err(err).context("Failed to read .wt directory"),
+    };
+
+    let porcelain_worktrees = list_porcelain_worktrees(main_repo).await.unwrap_or_default();
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let git_path = path.join(".git");
+        if !git_path.exists() {
+            continue;
+        }
+
+        let kind = if git_path.is_dir() {
+            FeatureKind::Clone
+        } else {
+            FeatureKind::Worktree
+        };
+
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+
+        let (branch, commit) = match kind {
+            FeatureKind::Clone => read_clone_head(&path).await.unwrap_or_else(|_| {
+                ("HEAD".to_string(), String::new())
+            }),
+            FeatureKind::Worktree => porcelain_worktrees
+                .iter()
+                .find(|(wt_path, _, _)| {
+                    std::fs::canonicalize(wt_path).ok().as_deref() == Some(&canon)
+                })
+                .map(|(_, branch, commit)| (branch.clone(), commit.clone()))
+                .unwrap_or_else(|| ("HEAD".to_string(), String::new())),
+        };
+
+        features.push(Feature {
+            path,
+            kind,
+            branch,
+            commit,
+            is_current: false,
+        });
+    }
+
+    if let Ok(current_path) = std::env::current_dir() {
+        let current_canon = std::fs::canonicalize(current_path).ok();
+        for f in &mut features {
+            if let Ok(f_canon) = std::fs::canonicalize(&f.path) {
+                if Some(&f_canon) == current_canon.as_ref() {
+                    f.is_current = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    features.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(features)
+}
+
+async fn list_porcelain_worktrees(repo: &Path) -> Result<Vec<(PathBuf, String, String)>> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to list worktrees"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut out = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_commit: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+
+    let flush = |path: &mut Option<PathBuf>,
+                 commit: &mut Option<String>,
+                 branch: &mut Option<String>,
+                 out: &mut Vec<(PathBuf, String, String)>| {
+        if let (Some(p), Some(c)) = (path.take(), commit.take()) {
+            out.push((p, branch.take().unwrap_or_else(|| "HEAD".to_string()), c));
+        } else {
+            branch.take();
+        }
+    };
+
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path));
+        } else if let Some(commit) = line.strip_prefix("HEAD ") {
+            current_commit = Some(commit.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            current_branch = Some(branch.to_string());
+        } else if line.is_empty() {
+            flush(&mut current_path, &mut current_commit, &mut current_branch, &mut out);
+        }
+    }
+    flush(&mut current_path, &mut current_commit, &mut current_branch, &mut out);
+
+    Ok(out)
+}
+
+async fn read_clone_head(path: &Path) -> Result<(String, String)> {
+    let branch_out = Command::new("git")
+        .current_dir(path)
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .output()
+        .await?;
+    let branch_name = String::from_utf8(branch_out.stdout)?.trim().to_string();
+    let branch_ref = if branch_name.is_empty() || branch_name == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        format!("refs/heads/{}", branch_name)
+    };
+
+    let commit_out = Command::new("git")
+        .current_dir(path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .await?;
+    let commit = String::from_utf8(commit_out.stdout)?.trim().to_string();
+
+    Ok((branch_ref, commit))
+}
+
+async fn get_main_branch(repo: &Path) -> Result<String> {
+    for branch in &["main", "master"] {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .arg("show-ref")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg(format!("refs/heads/{}", branch))
+            .output()
+            .await?;
+
+        if output.status.success() {
+            return Ok(branch.to_string());
+        }
+    }
+
+    Err(anyhow!("Could not find main or master branch"))
+}
+
+async fn fetch_origin(repo: &Path) -> Result<()> {
+    let has_remote = Command::new("git")
+        .current_dir(repo)
+        .arg("remote")
+        .output()
+        .await?
+        .stdout
+        .contains(&b"origin"[0]);
+
+    if !has_remote {
+        return Ok(());
+    }
+
+    println!("Fetching latest changes from origin...");
+
+    let main_result = Command::new("git")
+        .current_dir(repo)
+        .arg("fetch")
+        .arg("origin")
+        .arg("main")
+        .output()
+        .await;
+
+    if main_result.is_ok() && main_result.unwrap().status.success() {
+        return Ok(());
+    }
+
+    let master_result = Command::new("git")
+        .current_dir(repo)
+        .arg("fetch")
+        .arg("origin")
+        .arg("master")
+        .output()
+        .await;
+
+    if master_result.is_ok() && master_result.unwrap().status.success() {
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+async fn run_command(cwd: &Path, cmd: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(cmd)
+        .current_dir(cwd)
+        .args(args)
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow!("Command failed: {} {}", cmd, args.join(" ")));
+    }
+
+    Ok(())
+}
+
+async fn is_rust_project(repo: &Path) -> Result<bool> {
+    Ok(repo.join("Cargo.toml").exists())
+}
+
+async fn is_cargo_workspace(repo: &Path) -> Result<bool> {
+    let cargo_toml = repo.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Ok(false);
+    }
+
+    let contents = tokio::fs::read_to_string(&cargo_toml).await?;
+    Ok(contents.lines().any(|line| line.trim().starts_with("[workspace]")))
+}
+
+async fn has_sccache() -> Result<bool> {
+    let output = Command::new("which")
+        .arg("sccache")
+        .output()
+        .await?;
+
+    Ok(output.status.success())
+}
+
+async fn setup_cargo_config(worktree_path: &Path, main_repo: &Path, feature: &str) -> Result<()> {
+    if !is_rust_project(main_repo).await? {
+        return Ok(());
+    }
+
+    if is_cargo_workspace(main_repo).await? {
+        println!("Cargo workspace detected, using default shared target directory");
+        return Ok(());
+    }
+
+    let cargo_dir = worktree_path.join(".cargo");
+    tokio::fs::create_dir_all(&cargo_dir).await?;
+
+    let target_dir = main_repo
+        .join(".cargo-cache/target")
+        .join(feature);
+
+    let relative_target = pathdiff::diff_paths(&target_dir, worktree_path)
+        .unwrap_or_else(|| target_dir.clone());
+
+    let mut config_content = String::new();
+    config_content.push_str("[build]\n");
+    config_content.push_str(&format!("target-dir = \"{}\"\n", relative_target.display()));
+
+    if has_sccache().await? {
+        config_content.push_str("\n[build]\n");
+        config_content.push_str("rustc-wrapper = \"sccache\"\n");
+        println!("Enabling sccache for compilation caching");
+    }
+
+    let config_path = cargo_dir.join("config.toml");
+    tokio::fs::write(&config_path, config_content).await?;
+
+    println!("Created .cargo/config.toml with target-dir: {}", relative_target.display());
+
+    Ok(())
+}
+
+async fn ensure_gitignore_entries(repo: &Path) -> Result<()> {
+    let gitignore_path = repo.join(".gitignore");
+    let entries = vec![".wt/", ".cargo-cache/"];
+
+    let existing_content = if gitignore_path.exists() {
+        tokio::fs::read_to_string(&gitignore_path).await?
+    } else {
+        String::new()
+    };
+
+    let mut new_entries = Vec::new();
+    for entry in &entries {
+        if !existing_content.lines().any(|line| line.trim() == *entry) {
+            new_entries.push(entry);
+        }
+    }
+
+    if !new_entries.is_empty() {
+        let mut content = existing_content;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+
+        if !content.contains("# Git worktrees") {
+            content.push_str("\n# Git worktrees (created by ft script)\n");
+        }
+
+        for entry in new_entries {
+            content.push_str(entry);
+            content.push('\n');
+        }
+
+        tokio::fs::write(&gitignore_path, content).await?;
+    }
+
+    Ok(())
+}
+
+async fn tmux_has_session(name: &str) -> Result<bool> {
+    let output = Command::new("tmux")
+        .arg("has-session")
+        .arg("-t")
+        .arg(name)
+        .output()
+        .await?;
+
+    Ok(output.status.success())
+}
+
+async fn tmux_current_session() -> Result<String> {
+    let output = Command::new("tmux")
+        .arg("display-message")
+        .arg("-p")
+        .arg("#{session_name}")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to get current tmux session"));
+    }
+
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+async fn tmux_new_session(name: &str, path: &Path) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(name)
+        .arg("-c")
+        .arg(path)
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to create tmux session"));
+    }
+
+    Ok(())
+}
+
+async fn tmux_new_window(name: &str, path: &Path) -> Result<()> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let output = Command::new("tmux")
+        .arg("new-window")
+        .arg("-P")
+        .arg("-F")
+        .arg("#{window_id}")
+        .arg("-n")
+        .arg(name)
+        .arg("-c")
+        .arg(&canon)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to create tmux window"));
+    }
+
+    let window_id = String::from_utf8(output.stdout)?.trim().to_string();
+    if !window_id.is_empty() {
+        let _ = Command::new("tmux")
+            .arg("set-option")
+            .arg("-w")
+            .arg("-t")
+            .arg(&window_id)
+            .arg("@ft-worktree")
+            .arg(canon.to_string_lossy().as_ref())
+            .status()
+            .await;
+    }
+
+    Ok(())
+}
+
+async fn tmux_attach_session(name: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("attach-session")
+        .arg("-t")
+        .arg(name)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to attach to tmux session"));
+    }
+
+    Ok(())
+}
+
+async fn tmux_select_window(name: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("select-window")
+        .arg("-t")
+        .arg(name)
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to select tmux window"));
+    }
+
+    Ok(())
+}
+
+async fn tmux_send_keys(target: &str, keys: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("send-keys")
+        .arg("-t")
+        .arg(target)
+        .arg(keys)
+        .arg("Enter")
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to send keys to tmux"));
+    }
+
+    Ok(())
+}
+
+async fn list_tmux_windows() -> Result<Vec<TmuxWindow>> {
+    let output = Command::new("tmux")
+        .arg("list-windows")
+        .arg("-a")
+        .arg("-F")
+        .arg("#{session_name}:#{window_index}\t#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@ft-worktree}")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut windows = Vec::new();
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 4 {
+            let session_window: Vec<&str> = parts[0].split(':').collect();
+            if session_window.len() == 2 {
+                let ft_worktree = parts.get(4)
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty());
+                windows.push(TmuxWindow {
+                    session: session_window[0].to_string(),
+                    window_index: session_window[1].to_string(),
+                    window_id: parts[1].to_string(),
+                    name: parts[2].to_string(),
+                    path: PathBuf::from(parts[3]),
+                    ft_worktree,
+                });
+            }
+        }
+    }
+
+    Ok(windows)
+}
+
+async fn find_windows_for_feature(feature: &Feature) -> Result<Vec<TmuxWindow>> {
+    let windows = list_tmux_windows().await?;
+    let feature_canon = std::fs::canonicalize(&feature.path).ok();
+
+    Ok(windows
+        .into_iter()
+        .filter(|w| {
+            if let Some(ref ft_path) = w.ft_worktree {
+                if let Some(ref f_canon) = feature_canon {
+                    if let Ok(stamped) = std::fs::canonicalize(ft_path) {
+                        return stamped == *f_canon;
+                    }
+                }
+                return false;
+            }
+
+            if let Some(ref f_canon) = feature_canon {
+                if let Ok(window_path_canon) = std::fs::canonicalize(&w.path) {
+                    if window_path_canon.starts_with(f_canon) {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        })
+        .collect())
+}
+
+async fn tmux_kill_window(target: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("kill-window")
+        .arg("-t")
+        .arg(target)
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to kill tmux window"));
+    }
+
+    Ok(())
+}
+
+async fn get_feature_status(feature: &Feature, main_repo: &Path) -> Result<FeatureStatus> {
+    let uncommitted_output = Command::new("git")
+        .current_dir(&feature.path)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .await?;
+
+    let uncommitted_count = if uncommitted_output.status.success() {
+        String::from_utf8(uncommitted_output.stdout)?
+            .lines()
+            .count()
+    } else {
+        0
+    };
+
+    let main_branch = get_main_branch(main_repo).await?;
+
+    let diff_output = Command::new("git")
+        .current_dir(&feature.path)
+        .arg("diff")
+        .arg(format!("origin/{}...HEAD", main_branch))
+        .arg("--shortstat")
+        .output()
+        .await?;
+
+    let (files_changed, insertions, deletions) = if diff_output.status.success() {
+        parse_diff_shortstat(&String::from_utf8(diff_output.stdout)?)
+    } else {
+        (0, 0, 0)
+    };
+
+    let landed_repo = match feature.kind {
+        FeatureKind::Worktree => main_repo.to_path_buf(),
+        FeatureKind::Clone => feature.path.clone(),
+    };
+    let is_landed = is_landed(&feature.branch, &feature.commit, &landed_repo).await?;
+
+    let pr_info = get_pr_info(&feature.branch).await.ok();
+
+    Ok(FeatureStatus {
+        uncommitted_count,
+        _files_changed: files_changed,
+        insertions,
+        deletions,
+        is_landed,
+        pr_info,
+    })
+}
+
+fn parse_diff_shortstat(output: &str) -> (usize, usize, usize) {
+    let mut files = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+
+    for part in output.split(',') {
+        let part = part.trim();
+        if let Some(num_str) = part.split_whitespace().next() {
+            if let Ok(num) = num_str.parse::<usize>() {
+                if part.contains("file") {
+                    files = num;
+                } else if part.contains("insertion") {
+                    insertions = num;
+                } else if part.contains("deletion") {
+                    deletions = num;
+                }
+            }
+        }
+    }
+
+    (files, insertions, deletions)
+}
+
+async fn is_landed(branch: &str, commit: &str, repo: &Path) -> Result<bool> {
+    let main_branch = get_main_branch(repo).await?;
+
+    let merge_base_output = Command::new("git")
+        .current_dir(repo)
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(commit)
+        .arg(format!("origin/{}", main_branch))
+        .output()
+        .await?;
+
+    if merge_base_output.status.success() {
+        return Ok(true);
+    }
+
+    let branch_name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    if get_pr_info(branch_name).await.is_ok() {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn get_pr_info(branch: &str) -> Result<PrInfo> {
+    let branch_name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+
+    let output = Command::new("gh")
+        .arg("pr")
+        .arg("list")
+        .arg("--state")
+        .arg("merged")
+        .arg("--head")
+        .arg(branch_name)
+        .arg("--json")
+        .arg("number,url")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!("gh CLI failed"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+
+    if let Some(pr) = prs.first() {
+        let number = pr["number"].as_u64().unwrap_or(0) as u32;
+        let url = pr["url"].as_str().unwrap_or("").to_string();
+
+        let ci_status = get_ci_status(number).await.unwrap_or(CiStatus::None);
+
+        return Ok(PrInfo {
+            number,
+            url,
+            ci_status,
+        });
+    }
+
+    let output = Command::new("gh")
+        .arg("pr")
+        .arg("list")
+        .arg("--head")
+        .arg(branch_name)
+        .arg("--json")
+        .arg("number,url")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!("gh CLI failed"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+
+    if let Some(pr) = prs.first() {
+        let number = pr["number"].as_u64().unwrap_or(0) as u32;
+        let url = pr["url"].as_str().unwrap_or("").to_string();
+
+        let ci_status = get_ci_status(number).await.unwrap_or(CiStatus::None);
+
+        return Ok(PrInfo {
+            number,
+            url,
+            ci_status,
+        });
+    }
+
+    Err(anyhow!("No PR found"))
+}
+
+async fn get_ci_status(pr_number: u32) -> Result<CiStatus> {
+    let output = Command::new("gh")
+        .arg("pr")
+        .arg("view")
+        .arg(pr_number.to_string())
+        .arg("--json")
+        .arg("statusCheckRollup")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(CiStatus::None);
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let data: serde_json::Value = serde_json::from_str(&stdout)?;
+
+    if let Some(checks) = data["statusCheckRollup"].as_array() {
+        if checks.is_empty() {
+            return Ok(CiStatus::None);
+        }
+
+        let mut has_pending = false;
+        let mut has_failure = false;
+
+        for check in checks {
+            if let Some(conclusion) = check["conclusion"].as_str() {
+                match conclusion {
+                    "FAILURE" | "TIMED_OUT" | "CANCELLED" => has_failure = true,
+                    "PENDING" | "IN_PROGRESS" => has_pending = true,
+                    _ => {}
+                }
+            } else if let Some(state) = check["state"].as_str() {
+                match state {
+                    "PENDING" | "IN_PROGRESS" => has_pending = true,
+                    "FAILURE" | "ERROR" => has_failure = true,
+                    _ => {}
+                }
+            }
+        }
+
+        if has_failure {
+            return Ok(CiStatus::Failure);
+        }
+        if has_pending {
+            return Ok(CiStatus::Pending);
+        }
+
+        return Ok(CiStatus::Success);
+    }
+
+    Ok(CiStatus::None)
+}
+
+async fn remove_feature(main_repo: &Path, feature: &Feature) -> Result<()> {
+    match feature.kind {
+        FeatureKind::Worktree => {
+            let status = Command::new("git")
+                .current_dir(main_repo)
+                .arg("worktree")
+                .arg("remove")
+                .arg(&feature.path)
+                .arg("--force")
+                .status()
+                .await?;
+
+            if !status.success() {
+                return Err(anyhow!("Failed to remove worktree"));
+            }
+            Ok(())
+        }
+        FeatureKind::Clone => {
+            tokio::fs::remove_dir_all(&feature.path)
+                .await
+                .with_context(|| {
+                    format!("Failed to remove clone at {}", feature.path.display())
+                })?;
+            Ok(())
+        }
+    }
+}
+
+fn run_cleanup_tui(items: Vec<CleanupItem>) -> Result<Vec<CleanupItem>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = run_tui_loop(&mut terminal, items);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut items: Vec<CleanupItem>,
+) -> Result<Vec<CleanupItem>> {
+    let mut state = ListState::default();
+    state.select(Some(0));
+
+    loop {
+        terminal.draw(|f| render_ui(f, &items, &mut state))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    return Ok(Vec::new());
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(Vec::new());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let i = state.selected().unwrap_or(0);
+                    if i < items.len() - 1 {
+                        state.select(Some(i + 1));
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let i = state.selected().unwrap_or(0);
+                    if i > 0 {
+                        state.select(Some(i - 1));
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(i) = state.selected() {
+                        if i < items.len() {
+                            items[i].selected = !items[i].selected;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    return Ok(items.into_iter().filter(|item| item.selected).collect());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn render_ui(f: &mut Frame, items: &[CleanupItem], state: &mut ListState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(f.area());
+
+    let header = Paragraph::new("ft cleanup — feature clones & legacy worktrees")
+    .block(Block::default().borders(Borders::ALL));
+
+    f.render_widget(header, chunks[0]);
+
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .map(|item| {
+            let branch_name = item.feature.branch.strip_prefix("refs/heads/").unwrap_or(&item.feature.branch);
+
+            let checkbox = if item.selected { "[✓]" } else { "[ ]" };
+
+            let kind_tag = match item.feature.kind {
+                FeatureKind::Clone => Span::styled(
+                    " [clone]",
+                    Style::default().fg(Color::Blue),
+                ),
+                FeatureKind::Worktree => Span::styled(
+                    " [worktree]",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            };
+
+            let status_tag = if item.status.is_landed {
+                Span::styled(" [LANDED]", Style::default().fg(Color::Green))
+            } else {
+                Span::styled(" [ACTIVE]", Style::default().fg(Color::Yellow))
+            };
+
+            let pr_text = if let Some(ref pr) = item.status.pr_info {
+                let ci_symbol = match pr.ci_status {
+                    CiStatus::Success => "✓",
+                    CiStatus::Failure => "✗",
+                    CiStatus::Pending => "⊙",
+                    CiStatus::None => "-",
+                };
+                format!("  PR #{} {}", pr.number, ci_symbol)
+            } else {
+                String::new()
+            };
+
+            let uncommitted_text = if item.status.uncommitted_count > 0 {
+                format!("⚠ {} uncommitted  |  ", item.status.uncommitted_count)
+            } else {
+                "Clean  |  ".to_string()
+            };
+
+            let diff_text = format!(
+                "+{}/{} vs main",
+                item.status.insertions, item.status.deletions
+            );
+
+            let tmux_text = if item.tmux_windows.is_empty() {
+                "  |  no tmux windows".to_string()
+            } else if item.tmux_windows.len() == 1 {
+                format!("  |  tmux: {}:{}", item.tmux_windows[0].session, item.tmux_windows[0].window_index)
+            } else {
+                format!("  |  tmux: {} windows", item.tmux_windows.len())
+            };
+
+            let open_tag = if item.has_open_window {
+                Span::styled(" [OPEN]", Style::default().fg(Color::Magenta))
+            } else {
+                Span::raw("")
+            };
+
+            let line1 = Line::from(vec![
+                Span::raw(format!("{} ", checkbox)),
+                Span::raw(branch_name),
+                kind_tag,
+                status_tag,
+                open_tag,
+                Span::styled(pr_text, Style::default().fg(Color::Cyan)),
+            ]);
+
+            let line2 = Line::from(format!("    {}", item.feature.path.display()));
+
+            let line3 = Line::from(format!(
+                "    {}{}{}",
+                uncommitted_text, diff_text, tmux_text
+            ));
+
+            ListItem::new(vec![line1, line2, line3, Line::from("")])
+        })
+        .collect();
+
+    let list = List::new(list_items)
+        .block(Block::default().borders(Borders::ALL))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    f.render_stateful_widget(list, chunks[1], state);
+
+    let selected_count = items.iter().filter(|i| i.selected).count();
+    let total_tmux: usize = items.iter().filter(|i| i.selected).map(|i| i.tmux_windows.len()).sum();
+    let landed_count = items.iter().filter(|i| i.selected && i.status.is_landed).count();
+    let active_count = selected_count - landed_count;
+
+    let summary = if selected_count > 0 {
+        format!(
+            "{} feature(s) + {} tmux window(s) selected  |  {} landed, {} active",
+            selected_count, total_tmux, landed_count, active_count
+        )
+    } else {
+        "No features selected".to_string()
+    };
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" navigate "),
+        Span::styled(" SPACE ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" toggle "),
+        Span::styled(" ENTER ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" confirm "),
+        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" quit  │  "),
+        Span::styled(&summary, Style::default().fg(Color::Cyan)),
+    ]));
+
+    f.render_widget(footer, chunks[2]);
+}
+
+async fn cmd_clean_stale_branches(no_fetch: bool, yes: bool) -> Result<()> {
+    let main_repo = find_main_repo().await?;
+    let main_branch = get_main_branch(&main_repo).await?;
+
+    if !no_fetch {
+        println!("Fetching origin with --prune...");
+        let status = Command::new("git")
+            .current_dir(&main_repo)
+            .arg("fetch")
+            .arg("--all")
+            .arg("--prune")
+            .status()
+            .await
+            .context("Failed to spawn git fetch")?;
+        if !status.success() {
+            eprintln!("Warning: git fetch --all --prune failed; classification may be stale");
+        }
+    }
+
+    let branches = list_branch_infos(&main_repo).await?;
+    let merged_set = list_merged_into_origin_main(&main_repo, &main_branch).await?;
+
+    let mut candidates: Vec<(BranchInfo, StaleReason)> = Vec::new();
+    for b in branches {
+        if !b.worktree_path.is_empty() {
+            continue;
+        }
+        if b.name == main_branch {
+            continue;
+        }
+        let is_gone = b.track.contains("gone");
+        let is_merged = merged_set.contains(&b.name);
+        let reason = match (is_gone, is_merged) {
+            (true, true) => StaleReason::GoneAndMerged,
+            (true, false) => StaleReason::Gone,
+            (false, true) => StaleReason::Merged,
+            (false, false) => continue,
+        };
+        candidates.push((b, reason));
+    }
+
+    if candidates.is_empty() {
+        println!("No stale branches in {}", main_repo.display());
+        return Ok(());
+    }
+
+    let max_tag = candidates.iter().map(|(_, r)| r.label().len() + 2).max().unwrap_or(0);
+    let max_name = candidates.iter().map(|(b, _)| b.name.len()).max().unwrap_or(0);
+
+    println!("\nStale branches in {}:\n", main_repo.display());
+    for (b, r) in &candidates {
+        let tag = format!("[{}]", r.label());
+        println!(
+            "  {:<tw$}  {:<nw$}  {}",
+            tag,
+            b.name,
+            b.subject,
+            tw = max_tag,
+            nw = max_name
+        );
+    }
+    println!();
+
+    if !yes {
+        print!("Delete {} branch(es)? (y/N): ", candidates.len());
+        io::Write::flush(&mut io::stdout())?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled");
+            return Ok(());
+        }
+    }
+
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    for (b, r) in &candidates {
+        let flag = if r.force() { "-D" } else { "-d" };
+        print!("Deleting {} ({})... ", b.name, r.label());
+        io::Write::flush(&mut io::stdout())?;
+        let output = Command::new("git")
+            .current_dir(&main_repo)
+            .arg("branch")
+            .arg(flag)
+            .arg(&b.name)
+            .output()
+            .await
+            .context("Failed to spawn git branch")?;
+        if output.status.success() {
+            println!("✓");
+            deleted += 1;
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("✗ ({})", stderr.trim());
+            failed += 1;
+        }
+    }
+
+    println!("\nDeleted {}/{} branches{}",
+        deleted,
+        candidates.len(),
+        if failed > 0 { format!(", {} failed", failed) } else { String::new() }
+    );
+
+    Ok(())
+}
+
+async fn list_branch_infos(repo: &Path) -> Result<Vec<BranchInfo>> {
+    let format = "%(refname:short)%00%(upstream:track)%00%(worktreepath)%00%(subject)";
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("for-each-ref")
+        .arg(format!("--format={}", format))
+        .arg("refs/heads/")
+        .output()
+        .await
+        .context("Failed to spawn git for-each-ref")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(4, '\0').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        out.push(BranchInfo {
+            name: parts[0].to_string(),
+            track: parts[1].to_string(),
+            worktree_path: parts[2].to_string(),
+            subject: parts[3].to_string(),
+        });
+    }
+    Ok(out)
+}
+
+async fn list_merged_into_origin_main(repo: &Path, main_branch: &str) -> Result<HashSet<String>> {
+    let origin_main = format!("origin/{}", main_branch);
+    let exists = Command::new("git")
+        .current_dir(repo)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(&origin_main)
+        .output()
+        .await?;
+    if !exists.status.success() {
+        return Ok(HashSet::new());
+    }
+
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("for-each-ref")
+        .arg("--format=%(refname:short)")
+        .arg(format!("--merged={}", origin_main))
+        .arg("refs/heads/")
+        .output()
+        .await
+        .context("Failed to spawn git for-each-ref --merged")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git for-each-ref --merged failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}

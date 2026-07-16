@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Specify the branch
+branch_name="$1"
+
+# Get the list of all commit hashes from main to the tip of the branch
+commits=$(git rev-list --reverse master..$branch_name)
+
+prev_commit=""
+for commit in $commits; do
+	if [ -z "$prev_commit" ]; then
+		# This is the first commit in the list, so there's no previous commit to diff against
+		prev_commit=$commit
+		continue
+	fi
+
+	# Print the diff stats between the previous commit and the current one
+	echo "Commits: $prev_commit..$commit"
+	git diff --stat $prev_commit..$commit
+	echo
+
+	# Update prev_commit to the current one for the next iteration
+	prev_commit=$commit
+done

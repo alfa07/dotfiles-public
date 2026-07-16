@@ -1,0 +1,42 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "indicator=\"${TMUX_AGENT_INDICATOR_DIR:-$HOME/.tmux/plugins/tmux-agent-indicator}/scripts/agent-state.sh\"; [ -x \"$indicator\" ] || exit 0; \"$indicator\" --agent codex --state off; \"$indicator\" --agent codex --state running"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "indicator=\"${TMUX_AGENT_INDICATOR_DIR:-$HOME/.tmux/plugins/tmux-agent-indicator}/scripts/agent-state.sh\"; [ -x \"$indicator\" ] || exit 0; \"$indicator\" --agent codex --state needs-input"
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$TMUX\" ] || exit 0; loc=$(tmux display-message -p '#S:#I' 2>/dev/null || echo codex); printf '\\ePtmux;\\e\\e]9;[%s] needs input\\a\\e\\\\\\a' \"$loc\" > /dev/tty 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$TMUX\" ] || exit 0; loc=$(tmux display-message -p '#S:#I' 2>/dev/null || echo codex); printf '\\ePtmux;\\e\\e]9;[%s] finished\\a\\e\\\\\\a' \"$loc\" > /dev/tty 2>/dev/null || true"
+          },
+          {
+            "type": "command",
+            "command": "indicator=\"${TMUX_AGENT_INDICATOR_DIR:-$HOME/.tmux/plugins/tmux-agent-indicator}/scripts/agent-state.sh\"; [ -x \"$indicator\" ] || exit 0; \"$indicator\" --agent codex --state done"
+          }
+        ]
+      }
+    ]
+  }
+}

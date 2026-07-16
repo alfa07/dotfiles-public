@@ -1,0 +1,127 @@
+#!/usr/bin/env tclsh
+
+package require json
+package require json::write
+
+proc get_api_key {} {
+    if {[info exists ::env(ANTHROPIC_API_KEY)]} {
+        return $::env(ANTHROPIC_API_KEY)
+    } else {
+        set env_file [file join [file dirname [info script]] ".env"]
+        if {[file exists $env_file]} {
+            set f [open $env_file r]
+            set content [read $f]
+            close $f
+            foreach line [split $content "\n"] {
+                if {[string match "ANTHROPIC_API_KEY=*" $line]} {
+                    return [lindex [split $line "="] 1]
+                }
+            }
+        }
+    }
+    error "ANTHROPIC_API_KEY not found in environment or .env file"
+}
+
+proc call_claude_api {api_key input request} {
+    set url "https://api.anthropic.com/v1/messages"
+    
+    if {$input eq ""} {
+        set content "Please generate the following CLI command: $request\n\nProvide only the command without any explanation."
+    } else {
+        set content "Here is the help output for a CLI command:\n\n$input\n\nBased on this help output, please generate the following CLI command: $request\n\nProvide only the command without any explanation."
+    }
+    
+    set body [json::write object \
+        model [json::write string "claude-3-5-sonnet-20240620"] \
+        max_tokens 1000 \
+        messages [json::write array \
+            [json::write object \
+                role [json::write string "user"] \
+                content [json::write string $content]
+            ]
+        ]
+    ]
+
+    # Escape special characters in the body for the shell
+    # set escaped_body [exec echo $body | sed {s/'/'\\\\''/g}]
+    # puts [list $body]
+    
+    set response [exec curl -s -X POST $url \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $api_key" \
+        -H "anthropic-version: 2023-06-01" \
+        --data-binary @- << $body]
+    
+    return [json::json2dict $response]
+}
+
+if {$argc < 1} {
+    puts stderr "Usage: $argv0 <request>"
+    exit 1
+}
+
+proc is_piped {} {
+    if {[file isdirectory /dev/fd]} {
+        # On Unix-like systems (including macOS)
+        # puts [file type /dev/fd/0]
+        return [expr {[file type /dev/fd/0] eq "fifo"}]
+    } elseif {$::tcl_platform(platform) eq "windows"} {
+        # On Windows
+        return [expr {![string match console [file type stdin]]}]
+    } else {
+        # Fallback method
+        return [expr {![fconfigure stdin -isatty]}]
+    }
+}
+
+if {[is_piped]} {
+    set input [read stdin]
+} else {
+    set input ""
+}
+set request [join $argv " "]
+puts "$request"
+
+set api_key [get_api_key]
+
+if {[catch {set response [call_claude_api $api_key $input $request]} error_msg]} {
+    puts stderr "Error calling Claude API: $error_msg"
+    exit 1
+}
+
+if {[dict exists $response error]} {
+    puts stderr "API Error: [dict get $response error message]"
+    exit 1
+}
+
+proc extract_content {response} {
+    set content_list [dict get $response content]
+    foreach content_item $content_list {
+        if {[dict get $content_item type] eq "text"} {
+            return [dict get $content_item text]
+        }
+    }
+    error "No text content found in the response"
+}
+
+if {[catch {set content [extract_content $response]} error_msg]} {
+    puts stderr "Error extracting content: $error_msg"
+    puts stderr "API Response: $response"
+    exit 1
+}
+
+proc send_to_tmux_pane {text} {
+    set escaped_text [regsub -all {'} $text {'\\''}]
+    
+    set cmd "tmux send-keys -t . C-m '$escaped_text'"
+    
+    set bg_cmd "sleep 0.5 && $cmd"
+    
+    if {[catch {exec sh -c $bg_cmd &} result]} {
+        puts stderr "Error sending keys to tmux: $result"
+        error "Error sending keys to tmux"
+    }
+}
+
+# puts $content
+send_to_tmux_pane $content

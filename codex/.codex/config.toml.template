@@ -1,0 +1,10 @@
+# Portable Codex preferences. Run sync-codex-config after stowing this package.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+
+[features]
+hooks = true
+
+[tui]
+vim_mode_default = true

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+ID=$(date +%s)-$$
+FAKE_HOME="$HOME/aimech/agent-${ID}/home"
+echo "Creating agent in $FAKE_HOME"
+
+# Create fake home with .settings
+mkdir -p "$FAKE_HOME/.claude"
+cp ~/.claude.json "$FAKE_HOME/.claude.json"
+
+unset ANTHROPIC_API_KEY
+# Provide the token via the environment (e.g. sourced from ~/.secrets) — never hardcode it here.
+: "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN before running fake_home}"
+export CLAUDE_CODE_OAUTH_TOKEN
+
+HOME="$FAKE_HOME" exec "$@"

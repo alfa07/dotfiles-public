@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /usr/bin/osascript "$(dirname "$0")/arrange-displays.applescript" "$@"

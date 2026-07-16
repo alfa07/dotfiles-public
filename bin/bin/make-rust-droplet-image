@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+
+# Exit on any error
+set -e
+set -x
+
+# Function to check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Check for doctl
+if ! command_exists doctl; then
+    echo "doctl is not installed. Please install it first."
+    exit 1
+fi
+
+# Ensure doctl is authenticated
+if ! doctl account get >/dev/null 2>&1; then
+    echo "Please authenticate doctl with 'doctl auth init' before running this script."
+    exit 1
+fi
+
+# Create droplet
+echo "Creating temporary droplet..."
+DROPLET_INFO=$(doctl compute droplet create rust-image-builder \
+    --image ubuntu-24-04-x64 \
+    --size s-4vcpu-8gb \
+    --region sfo3 \
+    --ssh-keys $(doctl compute ssh-key list --format ID --no-header) \
+    --format ID,PublicIPv4 \
+    --no-header)
+
+DROPLET_ID=$(echo $DROPLET_INFO | awk '{print $1}')
+
+echo "Droplet created with ID: $DROPLET_ID"
+
+# Wait for droplet to be active
+echo "Waiting for droplet to become active..."
+while [[ $(doctl compute droplet get $DROPLET_ID --format Status --no-header) != "active" ]]; do
+    sleep 5
+done
+
+# Get droplet IP
+IP=$(doctl compute droplet get $DROPLET_ID --format PublicIPv4 --no-header)
+echo "Droplet IP: $IP"
+
+# Wait for SSH to be available
+echo "Waiting for SSH to become available..."
+while ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$IP echo ready 2>/dev/null
+do
+    sleep 5
+done
+
+# Install Rust and other necessary tools
+echo "Installing Rust and tools..."
+ssh -o StrictHostKeyChecking=no root@$IP << EOF
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+    apt-get install -y build-essential curl
+
+    # Install Rust
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    echo 'source $HOME/.cargo/env' >> $HOME/.bashrc
+
+    # Clean up
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+EOF
+
+# Power off the droplet
+echo "Powering off the droplet..."
+doctl compute droplet-action power-off $DROPLET_ID
+
+# Wait for the droplet to power off
+echo "Waiting for droplet to power off..."
+while [[ $(doctl compute droplet get $DROPLET_ID --format Status --no-header) != "off" ]]; do
+    sleep 5
+done
+
+# Create a snapshot
+echo "Creating snapshot..."
+SNAPSHOT_ID=$(doctl compute droplet-action snapshot $DROPLET_ID --snapshot-name rust-image --format ID --no-header)
+
+# Wait for the snapshot to complete
+echo "Waiting for snapshot $SNAPSHOT_ID to complete..."
+while [[ $(doctl compute snapshot get $SNAPSHOT_ID --format Status --no-header) != "available" ]]; do
+    sleep 10
+done
+
+# Delete the temporary droplet
+echo "Deleting temporary droplet..."
+doctl compute droplet delete $DROPLET_ID -f
+
+echo "Custom image creation complete!"
+echo "Snapshot ID: $SNAPSHOT_ID"
+echo "You can now use this snapshot ID when creating new droplets with Rust pre-installed."

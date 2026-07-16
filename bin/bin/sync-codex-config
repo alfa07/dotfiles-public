@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Merge portable Codex preferences without replacing machine-local state."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import stat
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+from typing import Any
+
+
+MANAGED_PATHS = (
+    ("model",),
+    ("model_reasoning_effort",),
+    ("plan_mode_reasoning_effort",),
+    ("features", "hooks"),
+    ("tui", "vim_mode_default"),
+)
+TABLE_HEADER_RE = re.compile(r"^\s*\[\[?.*?\]\]?\s*(?:#.*)?$")
+
+
+def parse_args() -> argparse.Namespace:
+    codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "merge the tracked portable Codex settings into the local config "
+            "while preserving trust decisions and generated state"
+        )
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit nonzero instead of updating an out-of-sync config",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=codex_home / "config.toml",
+        help="local config to update (default: $CODEX_HOME/config.toml)",
+    )
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=codex_home / "config.toml.template",
+        help="managed template (default: $CODEX_HOME/config.toml.template)",
+    )
+    return parser.parse_args()
+
+
+def load_toml(path: Path, *, missing_ok: bool = False) -> tuple[str, dict[str, Any]]:
+    if missing_ok and not path.exists():
+        return "", {}
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read {path}: {error}") from error
+
+    try:
+        return text, tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"invalid TOML in {path}: {error}") from error
+
+
+def leaf_paths(value: Any, prefix: tuple[str, ...] = ()) -> set[tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {prefix}
+
+    paths: set[tuple[str, ...]] = set()
+    for key, child in value.items():
+        paths.update(leaf_paths(child, prefix + (key,)))
+    return paths
+
+
+def nested_value(data: dict[str, Any], path: tuple[str, ...]) -> Any:
+    value: Any = data
+    for key in path:
+        value = value[key]
+    return value
+
+
+def render_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\b", "\\b")
+            .replace("\t", "\\t")
+            .replace("\n", "\\n")
+            .replace("\f", "\\f")
+            .replace("\r", "\\r")
+        )
+        return f'"{escaped}"'
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    raise ValueError(f"unsupported managed TOML value: {value!r}")
+
+
+def is_table_header(line: str) -> bool:
+    return TABLE_HEADER_RE.match(line.rstrip("\n")) is not None
+
+
+def exact_table_header(line: str, section: str) -> bool:
+    pattern = rf"^\s*\[\s*{re.escape(section)}\s*\]\s*(?:#.*)?$"
+    return re.match(pattern, line.rstrip("\n")) is not None
+
+
+def key_assignment(line: str, key: str) -> bool:
+    pattern = rf"^\s*{re.escape(key)}\s*="
+    return re.match(pattern, line) is not None
+
+
+def set_top_level(lines: list[str], key: str, value: str) -> list[str]:
+    end = next((index for index, line in enumerate(lines) if is_table_header(line)), len(lines))
+    matches = [index for index in range(end) if key_assignment(lines[index], key)]
+    replacement = f"{key} = {value}\n"
+
+    if len(matches) > 1:
+        raise ValueError(f"multiple top-level assignments for {key}")
+    if matches:
+        lines[matches[0]] = replacement
+        return lines
+
+    insertion = end
+    while insertion > 0 and not lines[insertion - 1].strip():
+        insertion -= 1
+    lines.insert(insertion, replacement)
+    return lines
+
+
+def set_table_value(lines: list[str], section: str, key: str, value: str) -> list[str]:
+    headers = [index for index, line in enumerate(lines) if exact_table_header(line, section)]
+    replacement = f"{key} = {value}\n"
+
+    if len(headers) > 1:
+        raise ValueError(f"multiple [{section}] tables")
+    if headers:
+        start = headers[0]
+        end = next(
+            (index for index in range(start + 1, len(lines)) if is_table_header(lines[index])),
+            len(lines),
+        )
+        matches = [index for index in range(start + 1, end) if key_assignment(lines[index], key)]
+        if len(matches) > 1:
+            raise ValueError(f"multiple assignments for {section}.{key}")
+        if matches:
+            lines[matches[0]] = replacement
+        else:
+            lines.insert(end, replacement)
+        return lines
+
+    child_pattern = re.compile(rf"^\s*\[\[?\s*{re.escape(section)}\.")
+    insertion = next(
+        (index for index, line in enumerate(lines) if child_pattern.match(line)),
+        len(lines),
+    )
+    block = [f"[{section}]\n", replacement, "\n"]
+    if insertion == len(lines) and lines and lines[-1].strip():
+        block.insert(0, "\n")
+    lines[insertion:insertion] = block
+    return lines
+
+
+def merged_config(text: str, template: dict[str, Any]) -> str:
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    for path in MANAGED_PATHS:
+        rendered = render_value(nested_value(template, path))
+        if len(path) == 1:
+            lines = set_top_level(lines, path[0], rendered)
+        else:
+            lines = set_table_value(lines, path[0], path[1], rendered)
+
+    result = "".join(lines)
+    tomllib.loads(result)
+    return result
+
+
+def write_atomic(path: Path, text: str, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(text)
+
+    try:
+        temporary.chmod(mode)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def main() -> int:
+    args = parse_args()
+    config = args.config.expanduser()
+    template_path = args.template.expanduser()
+
+    try:
+        _, template = load_toml(template_path)
+        actual_paths = leaf_paths(template)
+        expected_paths = set(MANAGED_PATHS)
+        if actual_paths != expected_paths:
+            missing = sorted(".".join(path) for path in expected_paths - actual_paths)
+            extra = sorted(".".join(path) for path in actual_paths - expected_paths)
+            details = []
+            if missing:
+                details.append(f"missing: {', '.join(missing)}")
+            if extra:
+                details.append(f"unsupported: {', '.join(extra)}")
+            raise ValueError(f"unexpected template keys ({'; '.join(details)})")
+
+        if config.is_symlink():
+            raise ValueError(f"{config} must remain a machine-local file, not a symlink")
+
+        current_text, _ = load_toml(config, missing_ok=True)
+        updated_text = merged_config(current_text, template)
+    except (KeyError, OSError, ValueError) as error:
+        print(f"sync-codex-config: {error}", file=sys.stderr)
+        return 2
+
+    if updated_text == current_text:
+        print(f"{config} is in sync")
+        return 0
+
+    if args.check:
+        print(f"{config} is out of sync", file=sys.stderr)
+        return 1
+
+    mode = stat.S_IMODE(config.stat().st_mode) if config.exists() else 0o600
+    try:
+        write_atomic(config, updated_text, mode)
+    except OSError as error:
+        print(f"sync-codex-config: cannot update {config}: {error}", file=sys.stderr)
+        return 2
+
+    print(f"updated {config}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

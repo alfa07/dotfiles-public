@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# Configuration
+REMOTE_HOST="ec2"
+SYNC_INTERVAL=2  # seconds
+SSH_TIMEOUT=5    # seconds
+
+# Check if we should use gtimeout or timeout
+TIMEOUT_CMD="timeout"
+if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+fi
+
+# Function to get MD5 of clipboard content
+get_clipboard_md5() {
+    pbpaste | md5
+}
+
+# Function to get remote clipboard MD5
+get_remote_md5() {
+    $TIMEOUT_CMD $SSH_TIMEOUT ssh -o ConnectTimeout=5 -o BatchMode=yes \
+        $REMOTE_HOST "DISPLAY=:99 xclip -selection clipboard -o | md5sum" || echo "timeout"
+}
+
+# Function to sync local to remote
+sync_to_remote() {
+    pbpaste | $TIMEOUT_CMD $SSH_TIMEOUT ssh -o ConnectTimeout=5 -o BatchMode=yes \
+        $REMOTE_HOST "DISPLAY=:99 xclip -selection clipboard"
+    if [ $? -eq 0 ]; then
+        echo "Synced to remote: $(date)"
+    else
+        echo "Failed to sync to remote: $(date)"
+    fi
+}
+
+# Function to sync remote to local
+sync_from_remote() {
+    $TIMEOUT_CMD $SSH_TIMEOUT ssh -o ConnectTimeout=5 -o BatchMode=yes \
+        $REMOTE_HOST "DISPLAY=:99 xclip -selection clipboard -o" | pbcopy
+    if [ $? -eq 0 ]; then
+        echo "Synced from remote: $(date)"
+    else
+        echo "Failed to sync from remote: $(date)"
+    fi
+}
+
+# Main loop
+last_local_md5=""
+last_remote_md5=""
+
+while true; do
+    current_local_md5=$(get_clipboard_md5)
+    current_remote_md5=$(get_remote_md5)
+
+    # Only proceed with sync if we got valid MD5s (not timeouts)
+    if [ "$current_remote_md5" != "timeout" ]; then
+        if [ "$current_local_md5" != "$last_local_md5" ]; then
+            sync_to_remote
+            last_local_md5=$current_local_md5
+        elif [ "$current_remote_md5" != "$last_remote_md5" ]; then
+            sync_from_remote
+            last_remote_md5=$current_remote_md5
+        fi
+    else
+        echo "Remote connection timed out: $(date)"
+    fi
+
+    sleep $SYNC_INTERVAL
+done

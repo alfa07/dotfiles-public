@@ -1,0 +1,691 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! ignore = "0.4.25"
+//! ```
+
+#[cfg(not(unix))]
+compile_error!("enforce-agents-md currently requires Unix symlinks");
+
+use ignore::WalkBuilder;
+use std::collections::BTreeMap;
+use std::env;
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+use std::path::{Component, Path, PathBuf};
+use std::process::{self, Command};
+
+const AGENTS: &str = "AGENTS.md";
+const CLAUDE: &str = "CLAUDE.md";
+
+#[derive(Default)]
+struct Stats {
+    dirs_seen: usize,
+    dirs_with_instructions: usize,
+    agents_created: usize,
+    agents_materialized: usize,
+    claude_links_created: usize,
+    already_ok: usize,
+    ignored_instruction_files: usize,
+    conflicts: usize,
+    errors: usize,
+}
+
+fn main() {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("error: {err}");
+            print_usage();
+            process::exit(2);
+        }
+    };
+
+    let root = match cli.root.canonicalize() {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!("error: cannot access {}: {err}", cli.root.display());
+            process::exit(2);
+        }
+    };
+
+    let mut stats = Stats::default();
+    let instruction_dirs = collect_instruction_dirs(&root, &mut stats);
+    for (dir, seen_files) in instruction_dirs {
+        enforce_dir(&root, &dir, seen_files, cli.check, &mut stats);
+    }
+
+    let create_verb = if cli.check { "would create" } else { "created" };
+    let materialize_verb = if cli.check {
+        "would materialize"
+    } else {
+        "materialized"
+    };
+    let link_verb = if cli.check {
+        "would create/replace"
+    } else {
+        "created/replaced"
+    };
+
+    eprintln!(
+        "checked {} non-ignored directories; found {} instruction director{}; {create_verb} {} AGENTS.md file{}; {materialize_verb} {} AGENTS.md symlink{}; {link_verb} {} CLAUDE.md link{}; skipped {} ignored instruction file{}",
+        stats.dirs_seen,
+        stats.dirs_with_instructions,
+        plural_y(stats.dirs_with_instructions),
+        stats.agents_created,
+        plural_s(stats.agents_created),
+        stats.agents_materialized,
+        plural_s(stats.agents_materialized),
+        stats.claude_links_created,
+        plural_s(stats.claude_links_created),
+        stats.ignored_instruction_files,
+        plural_s(stats.ignored_instruction_files),
+    );
+
+    if stats.conflicts > 0 || stats.errors > 0 {
+        eprintln!(
+            "left {} conflict{} and {} error{} unresolved",
+            stats.conflicts,
+            plural_s(stats.conflicts),
+            stats.errors,
+            plural_s(stats.errors),
+        );
+        process::exit(1);
+    }
+
+    let changes_required =
+        stats.agents_created + stats.agents_materialized + stats.claude_links_created;
+    if cli.check && changes_required > 0 {
+        eprintln!(
+            "check failed: {} change{} required",
+            changes_required,
+            plural_s(changes_required),
+        );
+        process::exit(1);
+    }
+}
+
+struct Cli {
+    root: PathBuf,
+    check: bool,
+}
+
+fn parse_cli() -> Result<Cli, String> {
+    let mut check = false;
+    let mut root = None;
+    let mut positional_only = false;
+
+    for arg in env::args_os().skip(1) {
+        if !positional_only && (arg == "--help" || arg == "-h") {
+            print_usage();
+            process::exit(0);
+        }
+
+        if !positional_only && arg == "--check" {
+            check = true;
+            continue;
+        }
+
+        if !positional_only && arg == "--" {
+            positional_only = true;
+            continue;
+        }
+
+        if !positional_only && arg.to_string_lossy().starts_with('-') {
+            return Err(format!("unknown option: {}", arg.to_string_lossy()));
+        }
+
+        if root.replace(PathBuf::from(arg)).is_some() {
+            return Err("expected at most one root path".to_string());
+        }
+    }
+
+    Ok(Cli {
+        root: root
+            .or_else(git_root)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        check,
+    })
+}
+
+fn print_usage() {
+    eprintln!(
+        "usage: enforce-agents-md [--check] [ROOT]\n\
+         \n\
+         Recursively scans ROOT, or the current git repository when ROOT is omitted,\n\
+         using the same ignore crate family as ripgrep to skip ignored paths.\n\
+         In each directory that has AGENTS.md or CLAUDE.md, ensures CLAUDE.md is a\n\
+         relative symlink to AGENTS.md without discarding differing file contents.\n\
+         \n\
+         --check reports required changes without writing and exits nonzero when\n\
+         any non-ignored instruction pair does not already satisfy the invariant."
+    );
+}
+
+fn git_root() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let root = stdout.trim();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SeenFiles {
+    agents: bool,
+    claude: bool,
+}
+
+fn collect_instruction_dirs(root: &Path, stats: &mut Stats) -> BTreeMap<PathBuf, SeenFiles> {
+    let mut instruction_dirs: BTreeMap<PathBuf, SeenFiles> = BTreeMap::new();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .sort_by_file_path(|left, right| left.cmp(right))
+        .filter_entry(|entry| entry.file_name() != OsStr::new(".git"));
+
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("warning: ignore-aware traversal error: {err}");
+                stats.errors += 1;
+                continue;
+            }
+        };
+
+        if entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            stats.dirs_seen += 1;
+        }
+
+        match entry.file_name().to_str() {
+            Some(AGENTS) => {
+                let seen = instruction_dirs
+                    .entry(parent_dir(root, entry.path()))
+                    .or_default();
+                seen.agents = true;
+            }
+            Some(CLAUDE) => {
+                let seen = instruction_dirs
+                    .entry(parent_dir(root, entry.path()))
+                    .or_default();
+                seen.claude = true;
+            }
+            _ => {}
+        }
+    }
+
+    instruction_dirs
+}
+
+fn parent_dir(root: &Path, path: &Path) -> PathBuf {
+    path.parent().unwrap_or(root).to_path_buf()
+}
+
+fn enforce_dir(root: &Path, dir: &Path, seen_files: SeenFiles, check: bool, stats: &mut Stats) {
+    let agents = dir.join(AGENTS);
+    let claude = dir.join(CLAUDE);
+    let agents_meta = match optional_symlink_metadata(&agents) {
+        Ok(meta) => meta,
+        Err(err) => {
+            warn(root, &agents, &format!("cannot stat {AGENTS}: {err}"));
+            stats.errors += 1;
+            return;
+        }
+    };
+    let claude_meta = match optional_symlink_metadata(&claude) {
+        Ok(meta) => meta,
+        Err(err) => {
+            warn(root, &claude, &format!("cannot stat {CLAUDE}: {err}"));
+            stats.errors += 1;
+            return;
+        }
+    };
+
+    let agents_exists = agents_meta.is_some();
+    let claude_exists = claude_meta.is_some();
+
+    if !agents_exists && !claude_exists {
+        return;
+    }
+
+    stats.dirs_with_instructions += 1;
+
+    if !agents_exists && path_is_gitignored(root, &agents) {
+        warn(
+            root,
+            &agents,
+            &format!("{AGENTS} is ignored by git rules; leaving directory unchanged"),
+        );
+        stats.ignored_instruction_files += 1;
+        return;
+    }
+
+    if !claude_exists && path_is_gitignored(root, &claude) {
+        warn(
+            root,
+            &claude,
+            &format!("{CLAUDE} is ignored by git rules; leaving directory unchanged"),
+        );
+        stats.ignored_instruction_files += 1;
+        return;
+    }
+
+    if agents_exists && !seen_files.agents {
+        warn(
+            root,
+            &agents,
+            &format!("{AGENTS} was filtered out by ignore rules; leaving directory unchanged"),
+        );
+        stats.ignored_instruction_files += 1;
+        return;
+    }
+
+    if claude_exists && !seen_files.claude {
+        warn(
+            root,
+            &claude,
+            &format!("{CLAUDE} was filtered out by ignore rules; leaving directory unchanged"),
+        );
+        stats.ignored_instruction_files += 1;
+        return;
+    }
+
+    if has_unusable_directory(root, &agents, agents_meta.as_ref(), stats)
+        || has_unusable_directory(root, &claude, claude_meta.as_ref(), stats)
+    {
+        return;
+    }
+
+    match (agents_exists, claude_exists) {
+        (true, true) => enforce_existing_pair(root, dir, check, stats),
+        (true, false) => enforce_agents_only(root, dir, check, stats),
+        (false, true) => enforce_claude_only(root, dir, check, stats),
+        (false, false) => {}
+    }
+}
+
+fn enforce_existing_pair(root: &Path, dir: &Path, check: bool, stats: &mut Stats) {
+    let agents = dir.join(AGENTS);
+    let claude = dir.join(CLAUDE);
+
+    let agents_contents = match fs::read(&agents) {
+        Ok(contents) => contents,
+        Err(err) => {
+            warn(
+                root,
+                &agents,
+                &format!("cannot read {AGENTS}: {err}; leaving pair unchanged"),
+            );
+            stats.errors += 1;
+            return;
+        }
+    };
+
+    let claude_contents = match fs::read(&claude) {
+        Ok(contents) => contents,
+        Err(err) => {
+            warn(
+                root,
+                &claude,
+                &format!("cannot read {CLAUDE}: {err}; leaving pair unchanged"),
+            );
+            stats.errors += 1;
+            return;
+        }
+    };
+
+    if agents_contents != claude_contents {
+        warn(
+            root,
+            dir,
+            &format!(
+                "both {AGENTS} and {CLAUDE} exist with different contents; leaving both unchanged"
+            ),
+        );
+        stats.conflicts += 1;
+        return;
+    }
+
+    if claude_link_is_correct(&claude) {
+        stats.already_ok += 1;
+        return;
+    }
+
+    if agents_symlink_points_at_claude(dir) {
+        if check {
+            stats.agents_materialized += 1;
+            println!("would materialize {}", display(root, &agents));
+        } else {
+            match write_file_atomically(&agents, &agents_contents) {
+                Ok(()) => {
+                    stats.agents_materialized += 1;
+                    println!("materialized {}", display(root, &agents));
+                }
+                Err(err) => {
+                    warn(
+                        root,
+                        &agents,
+                        &format!("cannot materialize {AGENTS}: {err}; leaving pair unchanged"),
+                    );
+                    stats.errors += 1;
+                    return;
+                }
+            }
+        }
+    }
+
+    if check {
+        stats.claude_links_created += 1;
+        println!("would link {} -> {}", display(root, &claude), AGENTS);
+        return;
+    }
+
+    match replace_claude_with_link(dir) {
+        Ok(()) => {
+            stats.claude_links_created += 1;
+            println!("linked {} -> {}", display(root, &claude), AGENTS);
+        }
+        Err(err) => {
+            warn(
+                root,
+                &claude,
+                &format!("cannot replace with symlink: {err}"),
+            );
+            stats.errors += 1;
+        }
+    }
+}
+
+fn enforce_agents_only(root: &Path, dir: &Path, check: bool, stats: &mut Stats) {
+    let agents = dir.join(AGENTS);
+    let claude = dir.join(CLAUDE);
+
+    if let Err(err) = fs::read(&agents) {
+        warn(
+            root,
+            &agents,
+            &format!("cannot read {AGENTS}: {err}; not creating {CLAUDE}"),
+        );
+        stats.errors += 1;
+        return;
+    }
+
+    if check {
+        stats.claude_links_created += 1;
+        println!("would link {} -> {}", display(root, &claude), AGENTS);
+        return;
+    }
+
+    match replace_claude_with_link(dir) {
+        Ok(()) => {
+            stats.claude_links_created += 1;
+            println!("linked {} -> {}", display(root, &claude), AGENTS);
+        }
+        Err(err) => {
+            warn(root, &claude, &format!("cannot create symlink: {err}"));
+            stats.errors += 1;
+        }
+    }
+}
+
+fn enforce_claude_only(root: &Path, dir: &Path, check: bool, stats: &mut Stats) {
+    let agents = dir.join(AGENTS);
+    let claude = dir.join(CLAUDE);
+
+    if check {
+        if let Err(err) = fs::read(&claude) {
+            warn(
+                root,
+                &claude,
+                &format!("cannot read {CLAUDE}: {err}; not creating {AGENTS}"),
+            );
+            stats.errors += 1;
+            return;
+        }
+
+        stats.agents_created += 1;
+        stats.claude_links_created += 1;
+        println!("would create {} from {}", display(root, &agents), CLAUDE);
+        println!("would link {} -> {}", display(root, &claude), AGENTS);
+        return;
+    }
+
+    match copy_file_atomically(&claude, &agents) {
+        Ok(()) => {
+            stats.agents_created += 1;
+            println!("created {} from {}", display(root, &agents), CLAUDE);
+        }
+        Err(err) => {
+            warn(
+                root,
+                &claude,
+                &format!("cannot copy contents to {AGENTS}: {err}; leaving {CLAUDE} unchanged"),
+            );
+            stats.errors += 1;
+            return;
+        }
+    }
+
+    match replace_claude_with_link(dir) {
+        Ok(()) => {
+            stats.claude_links_created += 1;
+            println!("linked {} -> {}", display(root, &claude), AGENTS);
+        }
+        Err(err) => {
+            warn(
+                root,
+                &claude,
+                &format!("cannot replace with symlink after creating {AGENTS}: {err}"),
+            );
+            stats.errors += 1;
+        }
+    }
+}
+
+fn has_unusable_directory(
+    root: &Path,
+    path: &Path,
+    meta: Option<&fs::Metadata>,
+    stats: &mut Stats,
+) -> bool {
+    if meta.map(|meta| meta.file_type().is_dir()).unwrap_or(false) {
+        warn(root, path, "is a directory; leaving it unchanged");
+        stats.errors += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn path_is_gitignored(root: &Path, path: &Path) -> bool {
+    let path = path.strip_prefix(root).unwrap_or(path);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "--quiet", "--no-index", "--"])
+        .arg(path)
+        .status();
+
+    match status {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+fn optional_symlink_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn claude_link_is_correct(claude: &Path) -> bool {
+    match fs::symlink_metadata(claude) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::read_link(claude)
+            .map(|target| target == Path::new(AGENTS))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn agents_symlink_points_at_claude(dir: &Path) -> bool {
+    let agents = dir.join(AGENTS);
+    let meta = match fs::symlink_metadata(&agents) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+
+    let target = match fs::read_link(&agents) {
+        Ok(target) => target,
+        Err(_) => return false,
+    };
+
+    let target = if target.is_absolute() {
+        target
+    } else {
+        dir.join(target)
+    };
+
+    normalize_path(&target) == normalize_path(&dir.join(CLAUDE))
+}
+
+fn replace_claude_with_link(dir: &Path) -> io::Result<()> {
+    let claude = dir.join(CLAUDE);
+    let tmp = temp_path(dir, CLAUDE)?;
+    symlink(AGENTS, &tmp)?;
+
+    match fs::rename(&tmp, &claude) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn copy_file_atomically(source: &Path, dest: &Path) -> io::Result<()> {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = temp_path(dir, AGENTS)?;
+    match fs::copy(source, &tmp) {
+        Ok(_) => {}
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+
+    match fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn write_file_atomically(dest: &Path, contents: &[u8]) -> io::Result<()> {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = temp_path(dir, AGENTS)?;
+    match fs::write(&tmp, contents) {
+        Ok(()) => {}
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+
+    match fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn temp_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    for attempt in 0..1000 {
+        let candidate = dir.join(format!(
+            ".{name}.enforce-agents-md.{}.tmp.{attempt}",
+            process::id()
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not find an unused temporary path",
+    ))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
+}
+
+fn display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn warn(root: &Path, path: &Path, message: &str) {
+    eprintln!("warning: {}: {message}", display(root, path));
+}
+
+fn plural_s(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn plural_y(count: usize) -> &'static str {
+    if count == 1 {
+        "y"
+    } else {
+        "ies"
+    }
+}

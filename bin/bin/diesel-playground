@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_DIR="${PLAYGROUNDS_DIR}/diesel-${TIMESTAMP}"
+
+# Create a new Rust project
+cargo new --bin "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Add dependencies
+cargo add tokio --features tokio/full
+cargo add axum
+cargo add diesel --features "sqlite"
+cargo add diesel_migrations
+cargo add serde --features derive
+cargo add dotenv
+
+# Create .env file
+echo "DATABASE_URL=sqlite://db.sqlite" > .env
+
+# Initialize Diesel
+diesel setup --database-url db.sqlite
+
+# Create migrations
+diesel migration generate create_users
+diesel migration generate create_api_keys
+
+# Write migration files
+cat > migrations/$(ls migrations | grep create_users)/up.sql <<EOF
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  username TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+EOF
+
+cat > migrations/$(ls migrations | grep create_users)/down.sql <<EOF
+DROP TABLE users;
+EOF
+
+cat > migrations/$(ls migrations | grep create_api_keys)/up.sql <<EOF
+CREATE TABLE api_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  user_id INTEGER NOT NULL,
+  key TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+EOF
+
+cat > migrations/$(ls migrations | grep create_api_keys)/down.sql <<EOF
+DROP TABLE api_keys;
+EOF
+
+# Run migrations
+diesel migration run
+
+# Create schema.rs
+diesel print-schema > src/schema.rs
+
+# Create models.rs
+cat > src/models.rs <<EOF
+use diesel::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Queryable, Selectable, Serialize, Deserialize)]
+#[diesel(table_name = crate::schema::users)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct User {
+    pub id: i32,
+    pub username: String,
+    pub email: String,
+    pub created_at: String,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::users)]
+pub struct NewUser {
+    pub username: String,
+    pub email: String,
+}
+
+#[derive(Queryable, Selectable, Serialize, Deserialize)]
+#[diesel(table_name = crate::schema::api_keys)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct ApiKey {
+    pub id: i32,
+    pub user_id: i32,
+    pub key: String,
+    pub created_at: String,
+}
+
+#[derive(Insertable, Deserialize)]
+#[diesel(table_name = crate::schema::api_keys)]
+pub struct NewApiKey {
+    pub user_id: i32,
+    pub key: String,
+}
+EOF
+
+# Create main.rs
+cat > src/main.rs <<EOF
+mod models;
+mod schema;
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{get, post, delete},
+    Json, Router,
+};
+use diesel::prelude::*;
+use diesel::r2d2::{self, ConnectionManager};
+use dotenv::dotenv;
+use models::{NewUser, User, NewApiKey, ApiKey};
+use std::env;
+use std::sync::Arc;
+
+type DbPool = r2d2::Pool<ConnectionManager<SqliteConnection>>;
+
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+    let pool = r2d2::Pool::builder()
+        .build(manager)
+        .expect("Failed to create pool.");
+
+    let app = Router::new()
+        .route("/users", get(list_users).post(create_user))
+        .route("/users/:id", get(get_user).delete(delete_user))
+        .route("/api_keys", get(list_api_keys).post(create_api_key))
+        .route("/api_keys/:id", get(get_api_key).delete(delete_api_key))
+        .with_state(Arc::new(pool));
+
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
+async fn list_users(State(pool): State<Arc<DbPool>>) -> Result<Json<Vec<User>>, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let users = schema::users::table
+        .load::<User>(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(users))
+}
+
+async fn create_user(
+    State(pool): State<Arc<DbPool>>,
+    Json(new_user): Json<NewUser>,
+) -> Result<Json<User>, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let user = diesel::insert_into(schema::users::table)
+        .values(&new_user)
+        .get_result::<User>(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(user))
+}
+
+async fn get_user(
+    State(pool): State<Arc<DbPool>>,
+    Path(id): Path<i32>,
+) -> Result<Json<User>, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let user = schema::users::table
+        .find(id)
+        .first::<User>(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(user))
+}
+
+async fn delete_user(
+    State(pool): State<Arc<DbPool>>,
+    Path(id): Path<i32>,
+) -> Result<StatusCode, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::delete(schema::users::table.find(id))
+        .execute(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_api_keys(State(pool): State<Arc<DbPool>>) -> Result<Json<Vec<ApiKey>>, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let api_keys = schema::api_keys::table
+        .load::<ApiKey>(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(api_keys))
+}
+
+async fn create_api_key(
+    State(pool): State<Arc<DbPool>>,
+    Json(new_api_key): Json<NewApiKey>,
+) -> Result<Json<ApiKey>, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let api_key = diesel::insert_into(schema::api_keys::table)
+        .values(&new_api_key)
+        .get_result::<ApiKey>(&mut conn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(api_key))
+}
+
+async fn get_api_key(
+    State(pool): State<Arc<DbPool>>,
+    Path(id): Path<i32>,
+) -> Result<Json<ApiKey>, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let api_key = schema::api_keys::table
+        .find(id)
+        .first::<ApiKey>(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(api_key))
+}
+
+async fn delete_api_key(
+    State(pool): State<Arc<DbPool>>,
+    Path(id): Path<i32>,
+) -> Result<StatusCode, StatusCode> {
+    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    diesel::delete(schema::api_keys::table.find(id))
+        .execute(&mut conn)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+EOF
+
+# Create README.md with instructions
+cat > README.md <<EOF
+# Diesel Playground
+
+This is a Rust Axum API server using Diesel ORM and SQLite.
+
+## Setup
+
+1. Make sure you have Rust and Cargo installed.
+2. Install the Diesel CLI:
+   \`\`\`
+   cargo install diesel_cli --no-default-features --features sqlite
+   \`\`\`
+3. Run the following commands:
+   \`\`\`
+   diesel setup
+   diesel migration run
+   cargo run
+   \`\`\`
+
+## Generating and Applying Migrations
+
+To generate a new migration:
+\`\`\`
+diesel migration generate <migration_name>
+\`\`\`
+
+To run migrations:
+\`\`\`
+diesel migration run
+\`\`\`
+
+To revert migrations:
+\`\`\`
+diesel migration revert
+\`\`\`
+
+## API Endpoints
+
+- GET /users - List all users
+- POST /users - Create a new user
+- GET /users/:id - Get a specific user
+- DELETE /users/:id - Delete a user
+
+- GET /api_keys - List all API keys
+- POST /api_keys - Create a new API key
+- GET /api_keys/:id - Get a specific API key
+- DELETE /api_keys/:id - Delete an API key
+
+EOF
+
+# Setup tmux
+tmux new-window \; \
+    rename-window "diesel-playground" \; \
+    send-keys "nvim ./src/main.rs" C-m \; \
+    split-window -h \; \
+    send-keys "cargo watch -x run" C-m \; \
+    select-pane -L
+
+echo "Diesel playground setup complete. Project directory: $PROJECT_DIR"

@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+PROJECT_DIR="${PLAYGROUNDS_DIR}/drizzle-express-${TIMESTAMP}"
+
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Initialize npm project and install dependencies
+npm init -y
+npm install express dotenv drizzle-orm better-sqlite3
+npm install -D typescript ts-node @types/node @types/express drizzle-kit
+
+# Create tsconfig.json
+cat > tsconfig.json <<EOF
+{
+  "compilerOptions": {
+    "target": "es6",
+    "module": "commonjs",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true
+  }
+}
+EOF
+
+# Create src directory and main file
+mkdir -p src
+cat > src/index.ts <<EOF
+import express from 'express';
+import dotenv from 'dotenv';
+import { userRouter } from './routes/userRoutes';
+import { apiKeyRouter } from './routes/apiKeyRoutes';
+
+dotenv.config();
+
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.use(express.json());
+
+app.use('/users', userRouter);
+app.use('/api-keys', apiKeyRouter);
+
+app.listen(port, () => {
+  console.log(\`Server running on port \${port}\`);
+});
+EOF
+
+# Create database schema
+mkdir -p src/db
+cat > src/db/schema.ts <<EOF
+import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
+
+export const users = sqliteTable('users', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  email: text('email').notNull().unique(),
+});
+
+export const apiKeys = sqliteTable('api_keys', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  key: text('key').notNull().unique(),
+  userId: integer('user_id').notNull().references(() => users.id),
+});
+EOF
+
+# Create database connection
+cat > src/db/index.ts <<EOF
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import Database from 'better-sqlite3';
+import * as schema from './schema';
+
+const sqlite = new Database('sqlite.db');
+export const db = drizzle(sqlite, { schema });
+EOF
+
+# Create user routes
+mkdir -p src/routes
+cat > src/routes/userRoutes.ts <<EOF
+import express from 'express';
+import { db } from '../db';
+import { users } from '../db/schema';
+import { eq } from 'drizzle-orm';
+
+export const userRouter = express.Router();
+
+userRouter.post('/', async (req, res) => {
+  const { name, email } = req.body;
+  const newUser = await db.insert(users).values({ name, email }).returning();
+  res.json(newUser[0]);
+});
+
+userRouter.get('/', async (req, res) => {
+  const allUsers = await db.select().from(users);
+  res.json(allUsers);
+});
+
+userRouter.get('/:id', async (req, res) => {
+  const user = await db.select().from(users).where(eq(users.id, parseInt(req.params.id)));
+  if (user.length === 0) {
+    res.status(404).json({ message: 'User not found' });
+  } else {
+    res.json(user[0]);
+  }
+});
+
+userRouter.put('/:id', async (req, res) => {
+  const { name, email } = req.body;
+  const updatedUser = await db.update(users)
+    .set({ name, email })
+    .where(eq(users.id, parseInt(req.params.id)))
+    .returning();
+  if (updatedUser.length === 0) {
+    res.status(404).json({ message: 'User not found' });
+  } else {
+    res.json(updatedUser[0]);
+  }
+});
+
+userRouter.delete('/:id', async (req, res) => {
+  const deletedUser = await db.delete(users)
+    .where(eq(users.id, parseInt(req.params.id)))
+    .returning();
+  if (deletedUser.length === 0) {
+    res.status(404).json({ message: 'User not found' });
+  } else {
+    res.json({ message: 'User deleted successfully' });
+  }
+});
+EOF
+
+# Create API key routes
+cat > src/routes/apiKeyRoutes.ts <<EOF
+import express from 'express';
+import { db } from '../db';
+import { apiKeys } from '../db/schema';
+import { eq } from 'drizzle-orm';
+import crypto from 'crypto';
+
+export const apiKeyRouter = express.Router();
+
+apiKeyRouter.post('/', async (req, res) => {
+  const { userId } = req.body;
+  const key = crypto.randomBytes(32).toString('hex');
+  const newApiKey = await db.insert(apiKeys).values({ key, userId }).returning();
+  res.json(newApiKey[0]);
+});
+
+apiKeyRouter.get('/', async (req, res) => {
+  const allApiKeys = await db.select().from(apiKeys);
+  res.json(allApiKeys);
+});
+
+apiKeyRouter.get('/:id', async (req, res) => {
+  const apiKey = await db.select().from(apiKeys).where(eq(apiKeys.id, parseInt(req.params.id)));
+  if (apiKey.length === 0) {
+    res.status(404).json({ message: 'API Key not found' });
+  } else {
+    res.json(apiKey[0]);
+  }
+});
+
+apiKeyRouter.delete('/:id', async (req, res) => {
+  const deletedApiKey = await db.delete(apiKeys)
+    .where(eq(apiKeys.id, parseInt(req.params.id)))
+    .returning();
+  if (deletedApiKey.length === 0) {
+    res.status(404).json({ message: 'API Key not found' });
+  } else {
+    res.json({ message: 'API Key deleted successfully' });
+  }
+});
+EOF
+
+# Create .env file
+cat > .env <<EOF
+PORT=3000
+EOF
+
+# Create README.md with instructions
+cat > README.md <<EOF
+# Express.js API with Drizzle ORM and SQLite
+
+This project sets up an Express.js API server using Drizzle ORM with SQLite and TypeScript.
+
+## Setup
+
+1. Install dependencies:
+   \`\`\`
+   npm install
+   \`\`\`
+
+2. Generate database migrations:
+   \`\`\`
+   npx drizzle-kit generate:sqlite
+   \`\`\`
+
+3. Apply migrations:
+   \`\`\`
+   npx drizzle-kit push:sqlite
+   \`\`\`
+
+4. Start the server:
+   \`\`\`
+   npm start
+   \`\`\`
+
+## API Endpoints
+
+- Users:
+  - POST /users
+  - GET /users
+  - GET /users/:id
+  - PUT /users/:id
+  - DELETE /users/:id
+
+- API Keys:
+  - POST /api-keys
+  - GET /api-keys
+  - GET /api-keys/:id
+  - DELETE /api-keys/:id
+
+## Database Migrations
+
+To generate new migrations after schema changes:
+
+1. Update the schema in \`src/db/schema.ts\`
+2. Run \`npx drizzle-kit generate:sqlite\`
+3. Apply the new migrations with \`npx drizzle-kit push:sqlite\`
+
+EOF
+
+# Update package.json scripts
+npm pkg set scripts.start="ts-node src/index.ts"
+npm pkg set scripts.build="tsc"
+npm pkg set scripts.dev="nodemon --exec ts-node src/index.ts"
+
+# Install development dependencies
+npm install -D nodemon
+
+# Initialize Git repository
+git init
+echo "node_modules\n.env\nsqlite.db" > .gitignore
+git add .
+git commit -m "Initial commit"
+
+echo "Express.js playground with Drizzle ORM and SQLite has been set up in ${PROJECT_DIR}"
+echo "To start the server, run:"
+echo "cd ${PROJECT_DIR} && npm start"

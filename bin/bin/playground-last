@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PLAYGROUNDS_DIR="${HOME}/playgrounds"
+PROJECT_DIR="$PLAYGROUNDS_DIR"/$(ls "${PLAYGROUNDS_DIR}" | tail -n 1)
+
+cd "$PROJECT_DIR"
+
+tmux new-window \; \
+	rename-window "playground" \; \
+	send-keys "lvim ./src/main.rs" C-m \; \
+	split-window -h \; \
+	send-keys "cargo watch -s 'clear && cargo run -q'" C-m \; \
+	select-pane -L

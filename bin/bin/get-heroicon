@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# Function to search for an icon
+search_icon() {
+    local search_term="$1"
+    local icon_type="$2"
+    local github_url="https://github.com/tailwindlabs/heroicons/tree/master/src/$icon_type"
+    
+    # Fetch the GitHub page and extract icon names
+    icons=$(curl -s "$github_url" | rg --pcre2 -o '(?<=title=").*?\.svg(?=")' | sed 's/\.svg//')
+    
+    # Search for matching icons
+    matches=$(echo "$icons" | rg -i "$search_term")
+    
+    if [ -z "$matches" ]; then
+        echo "No matches found for '$search_term' in $icon_type icons."
+        return 1
+    else
+        echo "Matching icons for '$search_term' in $icon_type icons:"
+        echo "$matches"
+        return 0
+    fi
+}
+
+# Function to download an icon
+download_icon() {
+    local icon_name="$1"
+    local icon_type="$2"
+    local output_dir="$3"
+    local url="https://raw.githubusercontent.com/tailwindlabs/heroicons/master/src/$icon_type/$icon_name.svg"
+    
+    mkdir -p "$output_dir"
+    if curl -s "$url" -o "$output_dir/$icon_name.svg"; then
+        echo "Downloaded $icon_name.svg to $output_dir"
+    else
+        echo "Failed to download $icon_name.svg"
+    fi
+}
+
+# Main script
+echo "Heroicons Downloader"
+echo "--------------------"
+
+read -p "Enter search term: " search_term
+read -p "Choose icon type (solid/outline/mini): " icon_type
+
+# if [ "$icon_type" != "solid" ] && [ "$icon_type" != "outline" ] && [ "$icon_type" != "mini" ]; then
+#     echo "Invalid icon type. Please choose solid, outline, or mini."
+#     exit 1
+# fi
+
+if search_icon "$search_term" "$icon_type"; then
+    read -p "Enter the exact icon name to download: " icon_name
+    read -p "Enter the output directory (default: ./icons): " output_dir
+    output_dir=${output_dir:-"./icons"}
+    
+    download_icon "$icon_name" "$icon_type" "$output_dir"
+fi

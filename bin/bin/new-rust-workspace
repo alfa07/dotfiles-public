@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+
+# Check if a workspace name is provided
+if [ $# -eq 0 ]; then
+    echo "Please provide a workspace name."
+    exit 1
+fi
+
+# Set the workspace name
+WORKSPACE_NAME=$1
+
+# Create the workspace directory
+mkdir -p "$WORKSPACE_NAME"
+cd "$WORKSPACE_NAME"
+
+# Create Cargo.toml
+cat > Cargo.toml << EOL
+[workspace]
+resolver = "2"
+members = []
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = 1
+
+[profile.release-lto]
+codegen-units = 1
+debug = "none"
+debug-assertions = false
+incremental = false
+inherits = "release"
+lto = "fat"
+opt-level = 3
+overflow-checks = false
+panic = "abort"
+strip = "symbols"
+EOL
+
+# Create .gitignore
+cat > .gitignore << EOL
+.*.swp
+tags
+target
+crates/**/Cargo.lock
+/deployment
+/.idea
+
+*.snap
+*.pyc
+*.profraw
+
+# Cargo timings
+cargo-timing-*.html
+cargo-timing.html
+.aider*
+Cargo.toml.pkg
+tarpaulin-report.html
+EOL
+
+# Create rustfmt.toml
+cat > rustfmt.toml << EOL
+edition = "2021"
+imports_granularity = "Crate"
+imports_layout = "Vertical"
+max_width = 79
+merge_derives = false
+use_small_heuristics = "Max"
+wrap_comments = true
+EOL
+
+echo "Rust workspace '$WORKSPACE_NAME' has been created successfully!"

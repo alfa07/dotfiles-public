@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# Get the currently opened file in Helix
+current_file=$(helix --health | awk '/^Loaded files:/ {print $3}')
+
+# Check if the file exists
+if [ -n "$current_file" ] && [ -e "$current_file" ]; then
+    # Navigate to the directory of the current file in ranger
+	echo "cd $(dirname "$current_file")" > /tmp/ranger_sync_command
+    # Select the current file in ranger
+    echo "select_file \"$(basename "$current_file")\"" >> /tmp/ranger_sync_command
+fi
