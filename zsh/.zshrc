@@ -18,6 +18,15 @@ function command_exists() {
 export PATH=$HOME/bin:$HOME/.local/bin:/usr/local/bin:$PATH
 export PATH=$PATH:$HOME/dev/roc/roc_nightly-macos_apple_silicon-2025-09-09-d73ea109cc2
 
+# python3 console scripts (e.g. pybritive, used by s/aws-creds) get installed
+# into the framework interpreter's bin, which isn't on PATH by default. Ask
+# python3 for it so this tracks whatever version is active.
+if command -v python3 >/dev/null 2>&1; then
+  _py3_scripts=$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null)
+  [[ -n "$_py3_scripts" && -d "$_py3_scripts" ]] && export PATH="$_py3_scripts:$PATH"
+  unset _py3_scripts
+fi
+
 # Path to your oh-my-zsh installation.
 export ZSH="$HOME/.oh-my-zsh"
 
