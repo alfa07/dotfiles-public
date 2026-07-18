@@ -19,6 +19,6 @@ if [ "$committer_email" != "$expected" ]; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-  echo "Fix with: git config user.email $expected" >&2
+  echo "Fix with: git config --local user.name \"Maxim Sokolov\" && git config --local user.email \"$expected\"" >&2
   exit 1
 fi
