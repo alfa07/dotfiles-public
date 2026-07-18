@@ -1,3 +1,0 @@
-2026-07-18T19:54:33.253500Z  INFO herdr::logging: herdr starting event="app.startup" subsystem="client" outcome="started" pid=16819
-2026-07-18T19:54:33.253546Z  INFO herdr::client: connecting to server path=/Users/msokolov/.config/herdr/herdr-client.sock
-2026-07-18T19:54:33.291872Z  INFO herdr::client: handshake succeeded version=16 encoding=SemanticFrame

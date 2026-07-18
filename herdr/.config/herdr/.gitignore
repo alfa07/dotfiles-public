@@ -1,0 +1,4 @@
+# herdr writes runtime state into its config dir; only track config.toml.
+*
+!.gitignore
+!config.toml
