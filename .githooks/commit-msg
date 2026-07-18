@@ -1,0 +1,10 @@
+#!/bin/sh
+# Reject any Co-Authored-By trailer (e.g. Claude/Anthropic co-author lines).
+
+msg_file="$1"
+
+if grep -v '^#' "$msg_file" | grep -iqE '^[[:space:]]*Co-authored-by:'; then
+  echo "commit-msg: 'Co-Authored-By:' trailers are not allowed in this repo." >&2
+  echo "Remove the trailer from the commit message and retry." >&2
+  exit 1
+fi

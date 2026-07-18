@@ -1,0 +1,24 @@
+#!/bin/sh
+# Enforce that commits in this repo are authored/committed as maximsok@gmail.com.
+# The Co-Authored-By check lives in the commit-msg hook (the message does not
+# exist yet at pre-commit time).
+
+expected="maximsok@gmail.com"
+
+author_email=$(git var GIT_AUTHOR_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')
+committer_email=$(git var GIT_COMMITTER_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')
+
+fail=0
+if [ "$author_email" != "$expected" ]; then
+  echo "pre-commit: author email '$author_email' is not '$expected'." >&2
+  fail=1
+fi
+if [ "$committer_email" != "$expected" ]; then
+  echo "pre-commit: committer email '$committer_email' is not '$expected'." >&2
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "Fix with: git config user.email $expected" >&2
+  exit 1
+fi
