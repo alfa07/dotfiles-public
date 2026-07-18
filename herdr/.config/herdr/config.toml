@@ -1,0 +1,13 @@
+# herdr configuration
+# Symlinked to ~/.config/herdr/config.toml via GNU Stow.
+
+[theme]
+# Built-in themes: catppuccin, terminal, tokyo-night, dracula, nord,
+#                  gruvbox, one-dark, solarized, kanagawa, rose-pine,
+#                  vesper
+name = "solarized-light"
+
+[keys]
+# Prefix key to enter prefix mode. Set to ctrl+space so the prefix
+# chord is ctrl-space (default is ctrl+b).
+prefix = "ctrl+space"
