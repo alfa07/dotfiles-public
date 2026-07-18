@@ -1,0 +1,22 @@
+[package]
+name = "ftlib"
+version = "0.1.0"
+edition = "2021"
+description = "Git feature-clone management with a pluggable terminal multiplexer (herdr / tmux)"
+
+[lib]
+name = "ftlib"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.28"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "5"
+pathdiff = "0.2"
+skim = "0.10"
+indicatif = "0.17"
