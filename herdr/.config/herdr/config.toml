@@ -1,13 +1,95 @@
+onboarding = false
 # herdr configuration
 # Symlinked to ~/.config/herdr/config.toml via GNU Stow.
 
 [theme]
 # Built-in themes: catppuccin, terminal, tokyo-night, dracula, nord,
 #                  gruvbox, one-dark, solarized, kanagawa, rose-pine,
-#                  vesper
+#                  vesper (plus -light/-dark/-latte/-day/-lotus/-dawn siblings)
 name = "solarized-light"
 
+[theme.custom]
+# Solarized blue accent, matching the tmux status-bar accent (#268bd2).
+accent = "#268bd2"
+
+[terminal]
+# Splits/tabs/workspaces inherit the focused pane's cwd (tmux -c "#{pane_current_path}").
+new_cwd = "follow"
+
+[ui]
+# Solarized blue accent for highlights, borders, and navigation UI.
+accent = "#268bd2"
+# tmux creates windows silently; skip herdr's tab-name prompt on prefix+c.
+prompt_new_tab_name = false
+
+# Sidebar replaces the tmux status bar. Per-token fg/bold/dim styling exists in
+# newer herdr builds but the installed 0.7.4 binary only accepts plain string
+# tokens, so these use strings; solarized accent comes from theme.custom/ui.accent.
+agent_panel_sort = "spaces"
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["branch", "git_status"]]
+
+[ui.sidebar.agents]
+rows = [["state_icon", "workspace", "tab"], ["agent"]]
+
+# Agent-state notifications (replaces the tmux-agent-indicator plugin behavior).
+[ui.toast]
+delivery = "terminal"
+
+[ui.sound.agents]
+claude = "on"
+
 [keys]
-# Prefix key to enter prefix mode. Set to ctrl+space so the prefix
-# chord is ctrl-space (default is ctrl+b).
+# Prefix chord is ctrl-space (tmux: set -g prefix C-Space).
 prefix = "ctrl+space"
+
+# Splits matching tmux muscle memory: v = side-by-side, s = stacked.
+split_vertical = "prefix+v"
+split_horizontal = "prefix+s"
+
+# Closest to tmux ^space last-window (herdr is pane-level). tmux double-tapped
+# the prefix, but herdr reserves prefix+prefix for a literal prefix, so use `;`.
+last_pane = "prefix+semicolon"
+
+# Optional prefix-free vim-style movement.
+# NOTE: NOT vim-split-aware like vim-tmux-navigator — these always move herdr
+# panes and will steal the chord from Vim. Uncomment only if you don't rely on
+# Vim splits in the focused pane.
+# focus_pane_left  = ["prefix+h", "ctrl+alt+h"]
+# focus_pane_down  = ["prefix+j", "ctrl+alt+j"]
+# focus_pane_up    = ["prefix+k", "ctrl+alt+k"]
+# focus_pane_right = ["prefix+l", "ctrl+alt+l"]
+
+# lazygit — replaces tmux `bind g new-window ... lazygit`.
+[[keys.command]]
+key = "prefix+i"
+type = "popup"
+command = "TERM=xterm-256color lazygit"
+description = "lazygit"
+width = "90%"
+height = "90%"
+
+# jjui — replaces tmux `bind u`.
+[[keys.command]]
+key = "prefix+u"
+type = "popup"
+command = "TERM=wezterm jjui"
+description = "jjui"
+width = "90%"
+height = "90%"
+
+# Arrange Chrome/Ghostty windows across displays (macOS) — replaces tmux `bind a run-shell`.
+[[keys.command]]
+key = "prefix+a"
+type = "shell"
+command = "~/bin/arrange-displays-tmux.sh"
+description = "arrange displays"
+
+# clipcast URL opener — replaces tmux `bind y run-shell`. The script reads the
+# focused pane via HERDR_ACTIVE_PANE_ID + `herdr pane read` (herdr's analog of
+# `tmux capture-pane`), grabs the last https URL, and opens it in Chrome.
+[[keys.command]]
+key = "prefix+y"
+type = "shell"
+command = "~/bin/herdr-open-url.sh"
+description = "open last url"
