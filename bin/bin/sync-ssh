@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# sync-ssh — copy the SSH keys in ~/.ssh to a Cloud Workspace host.
+#
+# Usage:
+#   sync-ssh [host]
+#
+#   host   SSH host/alias to sync keys to. If omitted, the host is taken from
+#          `sf ws list`: auto-selected when exactly one workspace exists,
+#          otherwise you pick from a menu (fzf, or a numbered prompt).
+#
+# What gets copied: every regular file in ~/.ssh that is a key (private or
+# .pub). config, known_hosts*, authorized_keys, and subdirectories are skipped.
+# Remote permissions are fixed afterwards: private keys 600, public keys 644,
+# ~/.ssh 700.
+set -euo pipefail
+
+SSH_DIR="$HOME/.ssh"
+
+die() { echo "sync-ssh: $*" >&2; exit 1; }
+
+# Names in ~/.ssh that are not keys and must never be synced.
+is_excluded() {
+  case "$1" in
+    config|known_hosts|known_hosts.old|known_hosts2|authorized_keys|environment|*.old|*.bak) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints the chosen host to stdout; all prompts/diagnostics go to stderr.
+pick_host() {
+  command -v sf >/dev/null 2>&1 || die "no host given and 'sf' not found on PATH"
+  command -v jq >/dev/null 2>&1 || die "no host given and 'jq' not found on PATH"
+
+  local json
+  json=$(sf ws list -o json 2>/dev/null) || die "'sf ws list' failed; pass a host explicitly"
+
+  local names=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && names+=("$n")
+  done < <(printf '%s' "$json" | jq -r '.[].name')
+
+  local count=${#names[@]}
+  (( count > 0 )) || die "no workspaces found in 'sf ws list'; pass a host explicitly"
+
+  if (( count == 1 )); then
+    echo "using only workspace: ${names[0]}" >&2
+    printf '%s\n' "${names[0]}"
+    return 0
+  fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "${names[@]}" | fzf --prompt="workspace> " --height='~40%' --no-multi
+  else
+    echo "select a workspace:" >&2
+    select h in "${names[@]}"; do
+      [[ -n "${h:-}" ]] && { printf '%s\n' "$h"; break; }
+    done
+  fi
+}
+
+sync_to() {
+  local host="$1"
+
+  local files=() base
+  for f in "$SSH_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    base=${f##*/}
+    is_excluded "$base" && continue
+    files+=("$f")
+  done
+  (( ${#files[@]} > 0 )) || die "no key files found in $SSH_DIR"
+
+  echo "Syncing ${#files[@]} key file(s) to '$host':"
+  printf '  %s\n' "${files[@]##*/}"
+
+  # Ensure remote ~/.ssh exists before copying.
+  ssh "$host" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh' || die "cannot reach host '$host'"
+
+  scp -q "${files[@]}" "$host:.ssh/" || die "scp to '$host' failed"
+
+  # Fix perms on exactly the files we copied (private 600, public 644).
+  local remote='cd ~/.ssh'
+  for f in "${files[@]}"; do
+    base=${f##*/}
+    if [[ "$base" == *.pub ]]; then
+      remote+=" && chmod 644 -- '$base'"
+    else
+      remote+=" && chmod 600 -- '$base'"
+    fi
+  done
+  ssh "$host" "$remote && chmod 700 ~/.ssh"
+
+  echo "Done. Remote ~/.ssh:"
+  ssh "$host" 'ls -la ~/.ssh/'
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
+  esac
+
+  local host="${1:-}"
+  if [[ -z "$host" ]]; then
+    host=$(pick_host) || exit 1
+    [[ -n "$host" ]] || die "no host selected"
+  fi
+  sync_to "$host"
+}
+
+main "$@"
