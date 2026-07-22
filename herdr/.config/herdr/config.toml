@@ -34,7 +34,7 @@ rows = [["state_icon", "workspace", "tab"], ["agent"]]
 
 # Agent-state notifications (replaces the tmux-agent-indicator plugin behavior).
 [ui.toast]
-delivery = "terminal"
+delivery = "herdr"
 
 [ui.sound.agents]
 claude = "on"
