@@ -12,6 +12,7 @@ set -u
 
 herdr="${HERDR_BIN_PATH:-herdr}"
 pane="${HERDR_ACTIVE_PANE_ID:-}"
+open_bin="$HOME/.clipcast/bin/open"
 
 log_dir="$HOME/.clipcast/logs"
 log="$log_dir/open-log.txt"
@@ -24,18 +25,41 @@ fi
 echo "--- $(date) ---" >>"$log"
 
 notify() {
-    "$herdr" notification show "$1" >>"$log" 2>&1 || true
+    local title="$1"
+    local body="${2:-}"
+    if [ -n "$body" ]; then
+        "$herdr" notification show "$title" --body "$body" >/dev/null 2>&1 || true
+    else
+        "$herdr" notification show "$title" >/dev/null 2>&1 || true
+    fi
 }
 
-if [ -z "$pane" ]; then
-    echo "no HERDR_ACTIVE_PANE_ID in environment" >>"$log"
-    notify "clipcast: no active pane"
+die() {
+    local title="$1"
+    local body="${2:-}"
+    echo "$title${body:+: $body}" >>"$log"
+    notify "$title" "$body"
     exit 1
+}
+
+# Preflight: clipcast open binary must exist.
+if [ ! -x "$open_bin" ]; then
+    die "clipcast: open binary missing" "$open_bin not found or not executable"
+fi
+
+if [ -z "$pane" ]; then
+    die "clipcast: no active pane" "HERDR_ACTIVE_PANE_ID is not set"
 fi
 
 notify "opening..."
 
-url=$("$herdr" pane read "$pane" --source recent-unwrapped --lines 200 2>>"$log" \
+pane_output=$("$herdr" pane read "$pane" --source recent-unwrapped --lines 200 2>>"$log")
+pane_exit=$?
+if [ $pane_exit -ne 0 ]; then
+    die "clipcast: pane read failed" "herdr pane read exited $pane_exit for pane $pane"
+fi
+
+url=$(printf '%s' "$pane_output" \
     | grep -oE "https://[^ ]+" \
     | tail -1 \
     | tr -d "\r")
@@ -43,17 +67,14 @@ url=$("$herdr" pane read "$pane" --source recent-unwrapped --lines 200 2>>"$log"
 echo "url: [$url]" >>"$log"
 
 if [ -z "$url" ]; then
-    notify "clipcast: no url found"
-    echo "no url" >>"$log"
-    exit 0
+    die "clipcast: no url found" "no https:// URL in the last 200 lines of pane $pane"
 fi
 
 notify "opening: $url"
 
-if RUST_LOG=info "$HOME/.clipcast/bin/open" -na "Google Chrome" \
+if RUST_LOG=info "$open_bin" -na "Google Chrome" \
     --args --profile-directory="Profile 2" "$url" >>"$log" 2>&1; then
     echo "opened ok" >>"$log"
 else
-    echo "open failed" >>"$log"
-    notify "clipcast: open failed"
+    die "clipcast: open failed" "$url — check $log"
 fi
