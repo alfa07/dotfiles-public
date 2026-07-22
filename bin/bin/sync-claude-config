@@ -49,9 +49,12 @@ MANAGED_KEYS = frozenset(
 )
 
 # Snowflake Cortex gate: when the base URL matches, the sf launcher forces
-# Sonnet, so pin the Opus 4.8 (1M) Cortex model id via settings.env.
+# Sonnet, so pin Opus 4.8 via settings.env. The "[1m]" suffix is a client-side
+# annotation, not a wire model id: Claude strips it and attaches the
+# `anthropic-beta: context-1m-2025-08-07` header, sending the bare
+# "claude-opus-4-8" (the only id the Cortex proxy accepts) with 1M context.
 CORTEX_HOST_MARKER = "snowflakecomputing.com"
-CORTEX_MODEL = "claude-opus-4-8-1m"
+CORTEX_MODEL = "claude-opus-4-8[1m]"
 
 
 def parse_args() -> argparse.Namespace:

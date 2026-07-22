@@ -55,9 +55,12 @@ sync-claude-config
 On Snowflake Cortex workspaces the `sf ai claude` launcher forces
 `ANTHROPIC_MODEL=claude-sonnet-4-6` into Claude's environment; a shell
 `export`/`unset` can't beat it (sf sets it downstream of the shell). The script
-detects the Cortex base URL and pins `env.ANTHROPIC_MODEL=claude-opus-4-8-1m` in
-`settings.json`, which Claude applies over the inherited value at startup. Other
-machines are left untouched.
+detects the Cortex base URL and pins `env.ANTHROPIC_MODEL=claude-opus-4-8[1m]`
+in `settings.json`, which Claude applies over the inherited value at startup.
+The `[1m]` is a client-side annotation, not a wire id: Claude strips it and
+sends the bare `claude-opus-4-8` (the only id the proxy accepts) plus the
+`anthropic-beta: context-1m-2025-08-07` header, giving Opus 4.8 with 1M context.
+Other machines are left untouched.
 
 ## Git hooks
 
