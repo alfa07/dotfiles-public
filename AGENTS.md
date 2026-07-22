@@ -40,6 +40,25 @@ preferences are merged rather than stowed over that file:
 sync-codex-config
 ```
 
+Claude Code has the same shape. It only loads user-scope settings from
+`~/.claude/settings.json` (there is **no** `~/.claude/settings.local.json`
+scope — `settings.local.json` exists only per-project), and on managed
+workspaces that file also carries machine-local wiring (`apiKeyHelper`,
+`awsCredentialExport`, `env`, `extraKnownMarketplaces`). So portable prefs live
+in `claude/.claude/settings.template.json` and are merged in rather than stowed
+over the file:
+
+```bash
+sync-claude-config
+```
+
+On Snowflake Cortex workspaces the `sf ai claude` launcher forces
+`ANTHROPIC_MODEL=claude-sonnet-4-6` into Claude's environment; a shell
+`export`/`unset` can't beat it (sf sets it downstream of the shell). The script
+detects the Cortex base URL and pins `env.ANTHROPIC_MODEL=claude-opus-4-8-1m` in
+`settings.json`, which Claude applies over the inherited value at startup. Other
+machines are left untouched.
+
 ## Git hooks
 
 This repo ships commit hooks in `.githooks/` that enforce the commit identity

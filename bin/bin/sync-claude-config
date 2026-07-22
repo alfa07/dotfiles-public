@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Merge portable Claude Code preferences without replacing machine-local state.
+
+Claude Code loads user-scope settings from ``~/.claude/settings.json`` only;
+``~/.claude/settings.local.json`` is *not* a user-scope file (``settings.local``
+exists only at the project level). So portable prefs must live in
+``settings.json`` to apply from every directory. That file, however, also holds
+machine-local wiring on managed workspaces (``apiKeyHelper``,
+``awsCredentialExport``, ``env``, ``extraKnownMarketplaces``). This script writes
+the tracked managed keys in and leaves everything else alone.
+
+On Snowflake Cortex workspaces the ``sf ai claude`` launcher forces
+``ANTHROPIC_MODEL=claude-sonnet-4-6`` in the child environment, and neither a
+shell export nor ``settings.model`` can beat an inherited env var. Claude does
+``Object.assign(process.env, settings.env)`` at startup, so pinning
+``env.ANTHROPIC_MODEL`` here is the one launch-path-independent override. We only
+do it when the base URL points at Cortex, so other machines are untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+# Top-level keys the tracked template is allowed to own. Each is replaced
+# wholesale in the local config; every other key is preserved as-is.
+MANAGED_KEYS = frozenset(
+    {
+        "editorMode",
+        "effortLevel",
+        "alwaysThinkingEnabled",
+        "tui",
+        "theme",
+        "agentPushNotifEnabled",
+        "skipDangerousModePermissionPrompt",
+        "skipAutoPermissionPrompt",
+        "permissions",
+        "enabledPlugins",
+        "hooks",
+    }
+)
+
+# Snowflake Cortex gate: when the base URL matches, the sf launcher forces
+# Sonnet, so pin the Opus 4.8 (1M) Cortex model id via settings.env.
+CORTEX_HOST_MARKER = "snowflakecomputing.com"
+CORTEX_MODEL = "claude-opus-4-8-1m"
+
+
+def parse_args() -> argparse.Namespace:
+    claude_home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "merge the tracked portable Claude Code settings into the local "
+            "user config while preserving machine-local wiring and state"
+        )
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit nonzero instead of updating an out-of-sync config",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=claude_home / "settings.json",
+        help="local config to update (default: ~/.claude/settings.json)",
+    )
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=claude_home / "settings.template.json",
+        help="managed template (default: ~/.claude/settings.template.json)",
+    )
+    return parser.parse_args()
+
+
+def load_json(path: Path, *, missing_ok: bool = False) -> dict[str, Any]:
+    if missing_ok and not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read {path}: {error}") from error
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON in {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return data
+
+
+def cortex_base_url(config: dict[str, Any]) -> bool:
+    env = config.get("env")
+    url = env.get("ANTHROPIC_BASE_URL", "") if isinstance(env, dict) else ""
+    url = url or os.environ.get("ANTHROPIC_BASE_URL", "")
+    return CORTEX_HOST_MARKER in url
+
+
+def merged_config(current: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(current)
+
+    for key, value in template.items():
+        result[key] = copy.deepcopy(value)
+
+    if cortex_base_url(result):
+        env = result.get("env")
+        if not isinstance(env, dict):
+            env = {}
+        env["ANTHROPIC_MODEL"] = CORTEX_MODEL
+        result["env"] = env
+
+    return result
+
+
+def write_atomic(path: Path, data: dict[str, Any], mode: int) -> None:
+    text = json.dumps(data, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(text)
+    try:
+        temporary.chmod(mode)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def main() -> int:
+    args = parse_args()
+    config_path = args.config.expanduser()
+    template_path = args.template.expanduser()
+
+    try:
+        template = load_json(template_path)
+        extra = sorted(set(template) - MANAGED_KEYS)
+        if extra:
+            raise ValueError(
+                f"template has unmanaged keys: {', '.join(extra)} "
+                f"(machine-local keys must not live in the template)"
+            )
+
+        if config_path.is_symlink():
+            raise ValueError(
+                f"{config_path} must remain a machine-local file, not a symlink"
+            )
+
+        current = load_json(config_path, missing_ok=True)
+        updated = merged_config(current, template)
+    except (KeyError, OSError, ValueError) as error:
+        print(f"sync-claude-config: {error}", file=sys.stderr)
+        return 2
+
+    if updated == current:
+        print(f"{config_path} is in sync")
+        return 0
+
+    if args.check:
+        print(f"{config_path} is out of sync", file=sys.stderr)
+        return 1
+
+    mode = stat.S_IMODE(config_path.stat().st_mode) if config_path.exists() else 0o600
+    try:
+        write_atomic(config_path, updated, mode)
+    except OSError as error:
+        print(
+            f"sync-claude-config: cannot update {config_path}: {error}",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"updated {config_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

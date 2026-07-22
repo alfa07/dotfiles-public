@@ -1,6 +1,18 @@
 {
+  "editorMode": "vim",
+  "effortLevel": "xhigh",
+  "alwaysThinkingEnabled": true,
+  "tui": "fullscreen",
+  "theme": "light",
+  "agentPushNotifEnabled": true,
+  "skipDangerousModePermissionPrompt": true,
+  "skipAutoPermissionPrompt": true,
   "permissions": {
     "defaultMode": "auto"
+  },
+  "enabledPlugins": {
+    "gopls-lsp@claude-plugins-official": true,
+    "rust-analyzer-lsp@claude-plugins-official": true
   },
   "hooks": {
     "SessionStart": [
@@ -63,20 +75,5 @@
         ]
       }
     ]
-  },
-  "enabledPlugins": {
-    "gopls-lsp@claude-plugins-official": true,
-    "rust-analyzer-lsp@claude-plugins-official": true
-  },
-  "alwaysThinkingEnabled": true,
-  "effortLevel": "xhigh",
-  "tui": "fullscreen",
-  "skipDangerousModePermissionPrompt": true,
-  "theme": "light",
-  "editorMode": "vim",
-  "agentPushNotifEnabled": true,
-  "skipAutoPermissionPrompt": true,
-  "feedbackSurveyState": {
-    "lastShownTime": 1753988130511
   }
 }
