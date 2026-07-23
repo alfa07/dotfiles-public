@@ -30,7 +30,7 @@ until the next edit. (`rust-script --clear-cache` also works.)
     feature.rs      # Feature/FeatureKind/FeatureStatus/PrInfo/CiStatus/... (pure data)
     git.rs          # git + gh helpers: repo discovery, clone, status, PR/CI, stale branches
     cargo_setup.rs  # per-feature cargo target-dir / sccache / /scratch seeding
-    commands.rs     # cmd_new/go/clean/restore/clean_stale_branches
+    commands.rs     # cmd_new/gr/go/clean/restore/clean_stale_branches
     tui.rs          # skim fuzzy finder + ratatui cleanup checklist
     mux/
       mod.rs        # Mux trait, Container, AgentStatus, Multiplexer enum + detect()
@@ -77,6 +77,23 @@ When adding a backend method, add it to the `Mux` trait, implement it in both
   `workspace create`, whose output we parse.
 - cwd values are canonicalized by herdr (`/tmp` → `/private/tmp`), so compare
   paths with `mux::canon` on both sides.
+
+## Gerrit changes (`ft gr <change>`)
+
+`cmd_gr` is like `cmd_new` but creates a **worktree** (not a clone) under
+`.wt/gerrit-<change>` checked out to a Gerrit change's latest patchset:
+
+1. Resolve the fetch remote — `ft.gerritRemote` git config, else `origin`.
+2. `git ls-remote <remote> "refs/changes/<shard>/<change>/*"` and pick the
+   highest numeric patchset (`meta`/non-numeric refs ignored). `<shard>` is the
+   change number mod 100, zero-padded (`94000` → `00`).
+3. `git fetch <remote> refs/changes/<shard>/<change>/<patchset>`, then
+   `git worktree add -b gerrit-<change> <path> FETCH_HEAD`. An existing local
+   branch is reused as-is (fetched patchset ignored).
+
+The worktree is a first-class feature: `list_features` classifies `.wt/*` with a
+`.git` **file** as `FeatureKind::Worktree`, and `remove_feature` cleans it via
+`git worktree remove`. All the git plumbing lives in `git.rs::create_gerrit_worktree`.
 
 ## Conventions
 

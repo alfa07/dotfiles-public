@@ -37,6 +37,7 @@ async fn dispatch() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::New { feature } => commands::cmd_new(&mux, &feature).await,
+        Commands::Gr { change } => commands::cmd_gr(&mux, change).await,
         Commands::Clean => commands::cmd_clean(&mux).await,
         Commands::Go { feature } => commands::cmd_go(&mux, &feature).await,
         Commands::Restore => commands::cmd_restore(&mux).await,

@@ -17,6 +17,11 @@ pub enum Commands {
         #[arg(help = "Feature branch name")]
         feature: String,
     },
+    #[command(about = "Create a worktree checked out to a Gerrit change and launch Claude Code")]
+    Gr {
+        #[arg(help = "Gerrit change number (e.g. 94000)")]
+        change: u64,
+    },
     #[command(about = "Interactive cleanup of landed feature clones/worktrees")]
     Clean,
     #[command(about = "Switch to the container for a feature branch")]

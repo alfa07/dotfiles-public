@@ -414,6 +414,139 @@ pub async fn create_feature_clone(
     Ok(())
 }
 
+/// Gerrit shard for a change number: the last two digits, zero-padded
+/// (`refs/changes/<shard>/<change>/<patchset>`). Change 94000 -> "00", 5 -> "05".
+fn gerrit_shard(change: u64) -> String {
+    format!("{:02}", change % 100)
+}
+
+/// Remote to fetch Gerrit changes from: `ft.gerritRemote` if set, else `origin`.
+async fn gerrit_remote(repo: &Path) -> Result<String> {
+    if let Some(remote) = git_effective_config(repo, "ft.gerritRemote").await? {
+        return Ok(remote);
+    }
+    Ok("origin".to_string())
+}
+
+/// Highest patchset number published for a Gerrit change, discovered via
+/// `git ls-remote`. The `meta` ref and any non-numeric patchset are ignored.
+async fn latest_gerrit_patchset(repo: &Path, remote: &str, change: u64) -> Result<u32> {
+    let shard = gerrit_shard(change);
+    let pattern = format!("refs/changes/{}/{}/*", shard, change);
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("ls-remote")
+        .arg(remote)
+        .arg(&pattern)
+        .output()
+        .await
+        .context("Failed to spawn git ls-remote")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git ls-remote {} {} failed: {}",
+            remote,
+            pattern,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut max_patchset = 0u32;
+    for line in stdout.lines() {
+        let refname = match line.split_once('\t') {
+            Some((_, r)) => r,
+            None => continue,
+        };
+        if let Some(patchset) = refname.rsplit('/').next() {
+            if let Ok(n) = patchset.parse::<u32>() {
+                max_patchset = max_patchset.max(n);
+            }
+        }
+    }
+
+    if max_patchset == 0 {
+        return Err(anyhow!(
+            "No patchsets found for change {} on remote {} (is the change number correct?)",
+            change,
+            remote
+        ));
+    }
+
+    Ok(max_patchset)
+}
+
+async fn local_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("refs/heads/{}", branch))
+        .output()
+        .await?;
+    Ok(output.status.success())
+}
+
+/// Create a worktree under `.wt/` checked out to the latest patchset of a Gerrit
+/// change. Fetches `refs/changes/<shard>/<change>/<patchset>` into the main repo,
+/// then adds a worktree on a fresh local branch pointing at it. If the branch
+/// already exists locally it is reused as-is (the fetched patchset is ignored).
+pub async fn create_gerrit_worktree(
+    main_repo: &Path,
+    feature_path: &Path,
+    branch: &str,
+    change: u64,
+) -> Result<()> {
+    let remote = gerrit_remote(main_repo).await?;
+    let patchset = latest_gerrit_patchset(main_repo, &remote, change).await?;
+    let shard = gerrit_shard(change);
+    let change_ref = format!("refs/changes/{}/{}/{}", shard, change, patchset);
+
+    println!(
+        "Fetching Gerrit change {} (patchset {}) from {}",
+        change, patchset, remote
+    );
+    run_command(main_repo, "git", &["fetch", &remote, &change_ref]).await?;
+
+    let feature_path_str = feature_path.to_string_lossy().to_string();
+
+    if local_branch_exists(main_repo, branch).await? {
+        println!(
+            "Local branch {} already exists; adding worktree on it (fetched patchset ignored)",
+            branch
+        );
+        run_command(
+            main_repo,
+            "git",
+            &["worktree", "add", &feature_path_str, branch],
+        )
+        .await?;
+    } else {
+        println!(
+            "Creating worktree {} on branch {} at {}",
+            feature_path.display(),
+            branch,
+            change_ref
+        );
+        run_command(
+            main_repo,
+            "git",
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &feature_path_str,
+                "FETCH_HEAD",
+            ],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 pub async fn get_feature_status(feature: &Feature, main_repo: &Path) -> Result<FeatureStatus> {
     let uncommitted_output = Command::new("git")
         .current_dir(&feature.path)

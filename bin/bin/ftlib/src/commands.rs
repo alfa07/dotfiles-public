@@ -8,9 +8,9 @@ use tokio::process::Command;
 
 use crate::cargo_setup::setup_cargo_config;
 use crate::git::{
-    classify_stale_branches, create_feature_clone, ensure_gitignore_entries, fetch_origin,
-    find_main_repo, get_feature_status, get_main_branch, list_branch_infos, list_features,
-    list_merged_into_origin_main, remove_feature,
+    classify_stale_branches, create_feature_clone, create_gerrit_worktree, ensure_gitignore_entries,
+    fetch_origin, find_main_repo, get_feature_status, get_main_branch, list_branch_infos,
+    list_features, list_merged_into_origin_main, remove_feature,
 };
 use crate::mux::Multiplexer;
 use crate::tui::{run_cleanup_tui, run_fuzzy_finder, CleanupItem};
@@ -49,6 +49,35 @@ pub async fn cmd_new(mux: &Multiplexer, feature: &str) -> Result<()> {
         println!("Reusing existing {} container for {}", mux.kind_label(), feature);
     }
     mux.focus(feature, &feature_path, true).await?;
+
+    Ok(())
+}
+
+pub async fn cmd_gr(mux: &Multiplexer, change: u64) -> Result<()> {
+    let main_repo = find_main_repo().await?;
+    println!("Main repository: {}", main_repo.display());
+
+    let feature = format!("gerrit-{}", change);
+    let feature_path = main_repo.join(".wt").join(&feature);
+
+    let existing_features = list_features(&main_repo).await?;
+    let feature_exists = existing_features.iter().any(|f| f.path == feature_path);
+
+    if feature_exists {
+        println!("Feature already exists at {}", feature_path.display());
+    } else {
+        std::fs::create_dir_all(main_repo.join(".wt")).context("Failed to create .wt directory")?;
+        create_gerrit_worktree(&main_repo, &feature_path, &feature, change).await?;
+    }
+
+    ensure_gitignore_entries(&main_repo).await?;
+    setup_cargo_config(&feature_path, &main_repo, &feature).await?;
+
+    let created = mux.ensure(&feature, &feature_path, LAUNCH_NEW).await?;
+    if !created {
+        println!("Reusing existing {} container for {}", mux.kind_label(), feature);
+    }
+    mux.focus(&feature, &feature_path, true).await?;
 
     Ok(())
 }
