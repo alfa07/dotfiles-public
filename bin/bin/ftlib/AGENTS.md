@@ -30,7 +30,7 @@ until the next edit. (`rust-script --clear-cache` also works.)
     feature.rs      # Feature/FeatureKind/FeatureStatus/PrInfo/CiStatus/... (pure data)
     git.rs          # git + gh helpers: repo discovery, clone, status, PR/CI, stale branches
     cargo_setup.rs  # per-feature cargo target-dir / sccache / /scratch seeding
-    commands.rs     # cmd_new/gr/go/clean/restore/clean_stale_branches
+    commands.rs     # cmd_new/gr/pr/go/clean/restore/clean_stale_branches
     tui.rs          # skim fuzzy finder + ratatui cleanup checklist
     mux/
       mod.rs        # Mux trait, Container, AgentStatus, Multiplexer enum + detect()
@@ -94,6 +94,27 @@ When adding a backend method, add it to the `Mux` trait, implement it in both
 The worktree is a first-class feature: `list_features` classifies `.wt/*` with a
 `.git` **file** as `FeatureKind::Worktree`, and `remove_feature` cleans it via
 `git worktree remove`. All the git plumbing lives in `git.rs::create_gerrit_worktree`.
+
+## GitHub PRs (`ft pr <number>`)
+
+`cmd_pr` is like `cmd_new` but checks out an existing GitHub pull request instead
+of branching off main. Like `new` it produces a **clone** (not a worktree) under
+`.wt/pr-<number>`:
+
+1. Clone `origin` into `.wt/pr-<number>` (same `--filter=blob:none --no-checkout
+   --reference-if-able` flags as `cmd_new`; `FT_NO_REFERENCE=1` disables the
+   reference), then copy `ft.mainRepo` + `user.name`/`user.email` config.
+2. `gh pr checkout <number> --branch pr-<number>` inside the clone. `gh` fetches
+   the PR head (via `refs/pull/<number>/head`, so **fork** PRs work too) and
+   lands it on a local `pr-<number>` branch. An existing local branch of that
+   name is reused by `gh`.
+
+The clone is a first-class `FeatureKind::Clone` feature (its `.git` is a
+directory), so `ft go`/`clean`/`restore` treat it exactly like a `new` clone and
+`remove_feature` cleans it via `remove_dir_all`. The plumbing lives in
+`git.rs::create_pr_clone`. Note the local branch is `pr-<number>`, not the PR's
+head ref name, so `get_feature_status`'s `gh pr list --head` lookup won't match —
+that only means an open PR isn't auto-selected in `ft clean` (conservative/safe).
 
 ## Conventions
 

@@ -22,6 +22,11 @@ pub enum Commands {
         #[arg(help = "Gerrit change number (e.g. 94000)")]
         change: u64,
     },
+    #[command(about = "Create a feature clone checked out to a GitHub PR and launch Claude Code")]
+    Pr {
+        #[arg(help = "GitHub PR number (e.g. 1234)")]
+        number: u64,
+    },
     #[command(about = "Interactive cleanup of landed feature clones/worktrees")]
     Clean,
     #[command(about = "Switch to the container for a feature branch")]

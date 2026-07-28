@@ -414,6 +414,68 @@ pub async fn create_feature_clone(
     Ok(())
 }
 
+/// Create a feature clone under `.wt/` checked out to a GitHub pull request.
+/// Clones `origin`, then runs `gh pr checkout <number> --branch <branch>` inside
+/// the clone so the PR head lands on a local `pr-<number>` branch (including PRs
+/// from forks, which `gh` fetches via `refs/pull/<number>/head`). An existing
+/// local branch of that name is reused by `gh`.
+pub async fn create_pr_clone(
+    main_repo: &Path,
+    feature_path: &Path,
+    branch: &str,
+    number: u64,
+) -> Result<()> {
+    let origin_url = git_remote_url(main_repo, "origin").await.with_context(|| {
+        "Main repository has no `origin` remote — `ft` PR mode requires an origin URL"
+    })?;
+
+    println!("Cloning {} into {}", origin_url, feature_path.display());
+
+    let use_reference = std::env::var("FT_NO_REFERENCE").ok().as_deref() != Some("1");
+
+    let main_repo_str = main_repo.to_string_lossy().to_string();
+    let feature_path_str = feature_path.to_string_lossy().to_string();
+
+    let mut clone_args: Vec<&str> = vec!["clone", "--filter=blob:none", "--no-checkout"];
+    if use_reference {
+        clone_args.push("--reference-if-able");
+        clone_args.push(&main_repo_str);
+    }
+    clone_args.push(&origin_url);
+    clone_args.push(&feature_path_str);
+
+    run_command(main_repo, "git", &clone_args).await?;
+
+    let main_repo_canon =
+        std::fs::canonicalize(main_repo).unwrap_or_else(|_| main_repo.to_path_buf());
+    let main_repo_canon_str = main_repo_canon
+        .to_str()
+        .context("Main repository path is not valid UTF-8")?;
+    run_command(
+        feature_path,
+        "git",
+        &["config", "--local", "ft.mainRepo", main_repo_canon_str],
+    )
+    .await?;
+
+    for key in ["user.name", "user.email"] {
+        if let Some(value) = git_effective_config(main_repo, key).await? {
+            run_command(feature_path, "git", &["config", "--local", key, value.as_str()]).await?;
+        }
+    }
+
+    println!("Checking out PR #{} onto branch {}", number, branch);
+    let number_str = number.to_string();
+    run_command(
+        feature_path,
+        "gh",
+        &["pr", "checkout", &number_str, "--branch", branch],
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Gerrit shard for a change number: the last two digits, zero-padded
 /// (`refs/changes/<shard>/<change>/<patchset>`). Change 94000 -> "00", 5 -> "05".
 fn gerrit_shard(change: u64) -> String {
