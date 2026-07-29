@@ -16,6 +16,12 @@ accent = "#268bd2"
 # Splits/tabs/workspaces inherit the focused pane's cwd (tmux -c "#{pane_current_path}").
 new_cwd = "follow"
 
+[worktrees]
+# Root under which herdr creates <repo>/<branch-slug> checkouts (default
+# ~/.herdr/worktrees). herdr has no per-repo option, so this is a single global
+# root; ~ is expanded at startup.
+directory = "~/.cursor/worktrees"
+
 [ui]
 # Solarized blue accent for highlights, borders, and navigation UI.
 accent = "#268bd2"
@@ -87,7 +93,8 @@ description = "arrange displays"
 
 # clipcast URL opener — replaces tmux `bind y run-shell`. The script reads the
 # focused pane via HERDR_ACTIVE_PANE_ID + `herdr pane read` (herdr's analog of
-# `tmux capture-pane`), grabs the last https URL, and opens it in Chrome.
+# `tmux capture-pane`), grabs the last https URL or /tmp/*.html link, and opens
+# it in Chrome: https → "Profile 2", local /tmp/*.html → Snowflake "Profile 1".
 [[keys.command]]
 key = "prefix+y"
 type = "shell"
