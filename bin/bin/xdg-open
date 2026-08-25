@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Cloud-workspace xdg-open shim.
+#
+# The bin/ package stows to ~/bin, which precedes /usr/bin on PATH. When
+# clipcast is present we are on a cloud box with no local browser, so route
+# opens to the Mac via clipcast-open. Otherwise defer to the real xdg-open.
+#
+# herdr 0.8.x invokes `xdg-open <url>` for Ctrl-clicked links and has no opener
+# config, so this shim is what redirects its clicks (and any other tool's) to
+# the Mac. herdr only makes http(s):// clickable, so file paths reach clipcast
+# via the prefix+y binding (herdr-open-url.sh), not through this shim.
+
+set -u
+
+self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+
+if [ -x "$HOME/.clipcast/bin/open" ]; then
+    for arg in "$@"; do
+        "$self_dir/clipcast-open" "$arg"
+    done
+    exit 0
+fi
+
+# Not a cloud box: exec the next xdg-open on PATH (skip our own dir).
+IFS=:
+for d in $PATH; do
+    [ "$d" = "$self_dir" ] && continue
+    if [ -x "$d/xdg-open" ]; then
+        exec "$d/xdg-open" "$@"
+    fi
+done
+exit 127

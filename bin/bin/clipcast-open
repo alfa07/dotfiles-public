@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Canonical "open a URL or local file on the Mac via clipcast" helper.
+#
+# Usage: clipcast-open <target> [base_cwd]
+#
+# <target> may be an https URL, a file:// URI, or an absolute/relative file
+# path. [base_cwd] resolves relative targets (default: $PWD).
+#
+# On a cloud workspace (where ~/.clipcast/bin/open exists) the target is handed
+# to the clipcast client, which relays/syncs it to the Mac and opens Chrome:
+# https URLs open in "Profile 2" (personal), local files in "Profile 1"
+# (Snowflake). On machines without clipcast it falls back to the real
+# xdg-open/open, so the shared bin/ package stays inert off the cloud box.
+#
+# Shared by the bin/xdg-open shim (herdr Ctrl-click + any tool) and by
+# herdr-open-url.sh (the herdr `prefix+y` binding).
+
+set -u
+
+open_bin="$HOME/.clipcast/bin/open"
+
+# Locate the real xdg-open, skipping this script's own dir so the bin/xdg-open
+# shim never recurses into itself.
+real_xdg_open() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+    local IFS=:
+    local d
+    for d in $PATH; do
+        [ "$d" = "$self_dir" ] && continue
+        if [ -x "$d/xdg-open" ]; then
+            printf '%s\n' "$d/xdg-open"
+            return 0
+        fi
+    done
+    return 1
+}
+
+target="${1:-}"
+base="${2:-$PWD}"
+[ -n "$target" ] || exit 0
+
+# file:// URI -> filesystem path (strip scheme and optional localhost host).
+case "$target" in
+    file://localhost/*) target="/${target#file://localhost/}" ;;
+    file:///*)          target="${target#file://}" ;;
+    file://*)           target="/${target#file://}" ;;
+esac
+
+# Resolve non-URL targets to an absolute, normalized path.
+case "$target" in
+    http://*|https://*) : ;;
+    /*)                 : ;;
+    "~/"*)              target="$HOME/${target#\~/}" ;;
+    *)                  target="$base/$target" ;;
+esac
+case "$target" in
+    http://*|https://*) : ;;
+    *) target="$(realpath -m -- "$target" 2>/dev/null || printf '%s' "$target")" ;;
+esac
+
+# Local files open in the Snowflake profile; https URLs in the personal one.
+case "$target" in
+    http://*|https://*) profile="Profile 2" ;;
+    *)                  profile="Profile 1" ;;
+esac
+
+if [ -x "$open_bin" ]; then
+    exec "$open_bin" -na "Google Chrome" --args --profile-directory="$profile" "$target"
+fi
+
+# Non-cloud fallback: hand off to the real opener.
+if rx="$(real_xdg_open)"; then
+    exec "$rx" "$target"
+fi
+if command -v open >/dev/null 2>&1; then
+    exec open "$target"
+fi
+exit 127

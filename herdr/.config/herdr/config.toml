@@ -91,12 +91,14 @@ type = "shell"
 command = "~/bin/arrange-displays-tmux.sh"
 description = "arrange displays"
 
-# clipcast URL opener — replaces tmux `bind y run-shell`. The script reads the
+# clipcast opener — replaces tmux `bind y run-shell`. The script reads the
 # focused pane via HERDR_ACTIVE_PANE_ID + `herdr pane read` (herdr's analog of
-# `tmux capture-pane`), grabs the last https URL or /tmp/*.html link, and opens
-# it in Chrome: https → "Profile 2", local /tmp/*.html → Snowflake "Profile 1".
+# `tmux capture-pane`), grabs the last https URL, file:// URI, or local file
+# path, and opens it on the Mac via clipcast-open: https → Chrome "Profile 2",
+# local files → Snowflake "Profile 1". (Ctrl-clicking an http(s) link in the UI
+# routes through the ~/bin/xdg-open shim to the same clipcast-open helper.)
 [[keys.command]]
 key = "prefix+y"
 type = "shell"
 command = "~/bin/herdr-open-url.sh"
-description = "open last url"
+description = "open last url or file"
