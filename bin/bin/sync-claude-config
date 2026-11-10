@@ -8,13 +8,6 @@ exists only at the project level). So portable prefs must live in
 machine-local wiring on managed workspaces (``apiKeyHelper``,
 ``awsCredentialExport``, ``env``, ``extraKnownMarketplaces``). This script writes
 the tracked managed keys in and leaves everything else alone.
-
-On Snowflake Cortex workspaces the ``sf ai claude`` launcher forces
-``ANTHROPIC_MODEL=claude-sonnet-4-6`` in the child environment, and neither a
-shell export nor ``settings.model`` can beat an inherited env var. Claude does
-``Object.assign(process.env, settings.env)`` at startup, so pinning
-``env.ANTHROPIC_MODEL`` here is the one launch-path-independent override. We only
-do it when the base URL points at Cortex, so other machines are untouched.
 """
 
 from __future__ import annotations
@@ -47,14 +40,6 @@ MANAGED_KEYS = frozenset(
         "hooks",
     }
 )
-
-# Snowflake Cortex gate: when the base URL matches, the sf launcher forces
-# Sonnet, so pin Opus 4.8 via settings.env. The "[1m]" suffix is a client-side
-# annotation, not a wire model id: Claude strips it and attaches the
-# `anthropic-beta: context-1m-2025-08-07` header, sending the bare
-# "claude-opus-4-8" (the only id the Cortex proxy accepts) with 1M context.
-CORTEX_HOST_MARKER = "snowflakecomputing.com"
-CORTEX_MODEL = "claude-opus-4-8[1m]"
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,25 +86,11 @@ def load_json(path: Path, *, missing_ok: bool = False) -> dict[str, Any]:
     return data
 
 
-def cortex_base_url(config: dict[str, Any]) -> bool:
-    env = config.get("env")
-    url = env.get("ANTHROPIC_BASE_URL", "") if isinstance(env, dict) else ""
-    url = url or os.environ.get("ANTHROPIC_BASE_URL", "")
-    return CORTEX_HOST_MARKER in url
-
-
 def merged_config(current: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(current)
 
     for key, value in template.items():
         result[key] = copy.deepcopy(value)
-
-    if cortex_base_url(result):
-        env = result.get("env")
-        if not isinstance(env, dict):
-            env = {}
-        env["ANTHROPIC_MODEL"] = CORTEX_MODEL
-        result["env"] = env
 
     return result
 

@@ -8,6 +8,12 @@ if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]
   source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
 fi
 
+# Meta devserver: load the corp rc and Meta-only settings (~/.zsh/meta.zsh).
+if [[ -r /usr/facebook/ops/rc/master.zshrc ]]; then
+  IS_META=1
+  source ~/.zsh/meta.zsh
+fi
+
 function command_exists() {
   command -v "$1" >/dev/null 2>&1 && "$1" "$2" >/dev/null 2>&1
 }
@@ -43,7 +49,7 @@ plugins=(
   zsh-syntax-highlighting
 )
 
-source $ZSH/oh-my-zsh.sh
+[[ -r $ZSH/oh-my-zsh.sh ]] && source $ZSH/oh-my-zsh.sh
 
 # User configuration
 
@@ -59,7 +65,7 @@ else
   export EDITOR='nvim'
 fi
 
-source ~/powerlevel10k/powerlevel10k.zsh-theme
+[[ -r ~/powerlevel10k/powerlevel10k.zsh-theme ]] && source ~/powerlevel10k/powerlevel10k.zsh-theme
 
 # To customize prompt, run `p10k configure` or edit ~/.p10k.zsh.
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
@@ -72,11 +78,13 @@ export NVM_DIR="$HOME/.nvm"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
    # echo "Linux"
-  eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+  [[ -x /home/linuxbrew/.linuxbrew/bin/brew ]] && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
   export PYENV_ROOT="$HOME/.pyenv"
-  eval "$(pyenv init -)"
   command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
-  alias brew='env PATH="${PATH//$(pyenv root)\/shims:/}" brew'
+  if command -v pyenv >/dev/null; then
+    eval "$(pyenv init -)"
+    alias brew='env PATH="${PATH//$(pyenv root)\/shims:/}" brew'
+  fi
   # [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
   # source ~/.zsh-base/fzf.zsh
   alias pbcopy="xclip -in -sel clip"
@@ -100,12 +108,13 @@ source $HOME/.config/broot/launcher/bash/br
 export EDITOR=nvim
 # echo "script dir" $SCRIPT_DIR
 
-if [[ -e ~/.secrets-obs ]]; then
+# Secrets are never loaded on Meta hosts.
+if [[ -z $IS_META && -e ~/.secrets-obs ]]; then
   source ~/.secrets-obs
 fi
 
-# Check if the SSH agent is running
-if [ -z "$SSH_AUTH_SOCK" ]; then
+# Check if the SSH agent is running (Meta hosts manage SSH auth themselves)
+if [[ -z $IS_META && -z "$SSH_AUTH_SOCK" ]]; then
     echo "agent is not running, starting..."
     eval "$(ssh-agent -s)"
 fi
@@ -166,7 +175,7 @@ export AIDER_LIGHT_MODE="true"
 # we use git-crypt
 # After cloning the repository
 # git-crypt unlock /path/to/git-crypt-key
-if [[ -e ~/.secrets ]]; then
+if [[ -z $IS_META && -e ~/.secrets ]]; then
   source ~/.secrets
 fi
 
@@ -179,8 +188,10 @@ fi
 export CARAPACE_BRIDGES='zsh,fish,bash,inshellisense' # optional
 # zstyle ':completion:*' format $'\e[2;37mCompleting %d\e[m'
 # source <(carapace _carapace)
-eval "$(atuin init zsh)"
-zvm_after_init_commands+=("bindkey '^r' _atuin_search_widget")
+if command -v atuin &> /dev/null; then
+  eval "$(atuin init zsh)"
+  zvm_after_init_commands+=("bindkey '^r' _atuin_search_widget")
+fi
 
 if [[ -e /usr/local/texlive/2024/bin/universal-darwin ]]; then
   export PATH="/usr/local/texlive/2024/bin/universal-darwin:$PATH"
@@ -238,11 +249,6 @@ function wez_notify() {
 
 if [[ -e /Applications/love.app ]]; then
   alias love="/Applications/love.app/Contents/MacOS/love"
-fi
-
-# sfid
-if command -v sf &> /dev/null; then
-  eval "$(sf aliases)"
 fi
 
 ## gcloud (macOS/Homebrew only — inert elsewhere)

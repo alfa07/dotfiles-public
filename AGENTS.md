@@ -52,36 +52,6 @@ over the file:
 sync-claude-config
 ```
 
-On Snowflake Cortex workspaces the `sf ai claude` launcher forces
-`ANTHROPIC_MODEL=claude-sonnet-4-6` into Claude's environment; a shell
-`export`/`unset` can't beat it (sf sets it downstream of the shell). The script
-detects the Cortex base URL and pins `env.ANTHROPIC_MODEL=claude-opus-4-8[1m]`
-in `settings.json`, which Claude applies over the inherited value at startup.
-The `[1m]` is a client-side annotation, not a wire id: Claude strips it and
-sends the bare `claude-opus-4-8` (the only id the proxy accepts) plus the
-`anthropic-beta: context-1m-2025-08-07` header, giving Opus 4.8 with 1M context.
-Other machines are left untouched.
-
-## Git hooks
-
-This repo ships commit hooks in `.githooks/` that enforce the commit identity
-and block `Co-Authored-By:` trailers. Git does not run tracked hooks on clone
-(that would be a security hole), so enable them once per clone:
-
-```bash
-git config --local core.hooksPath .githooks
-```
-
-Once enabled:
-
-- **`pre-commit`** rejects the commit unless the author *and* committer email
-  are `maximsok@gmail.com`. On mismatch it prints the fix:
-  `git config --local user.name "Maxim Sokolov" && git config --local user.email "maximsok@gmail.com"`.
-- **`commit-msg`** rejects any message containing a `Co-Authored-By:` trailer.
-
-The hooks are repo-local on purpose — a global hook would break commits made
-under other identities (e.g. work repos).
-
 ## Multi-machine sync workflow
 
 These dotfiles are shared across several machines/locations. `main` is the
@@ -135,6 +105,28 @@ if-shell 'uname | grep -q Darwin' 'set -g @something "mac-value"'
 ```
 
 Keep the guard next to the change so the intent is obvious at the merge.
+
+## Meta devservers
+
+Branch: `meta-devserver`. The repo lives at `~/dotfiles` because that path is on
+DotSync's default include list, so the repo *and* the stow symlinks travel to
+every new devserver. DotSync stores symlinks as links, so a repo anywhere else
+would leave them dangling. CLI tools come from devfeature (`feature persist …`
+writes `~/.config/devfeature/enabled-features.toml`, which DotSync also syncs).
+
+- A Meta host is detected by `/usr/facebook/ops/rc/master.zshrc`; `.zshrc` then
+  sets `IS_META=1` and sources `~/.zsh/meta.zsh`. That file replaces the stock Meta
+  `~/.zshrc`, which stowing ours removes.
+- On Meta hosts: secrets are never sourced, there's no ssh-agent autostart, and
+  `ATUIN_AUTO_SYNC=false` is exported (zshenv, fish, nushell env.nu) so shell
+  history never leaves the host.
+- `.zshenv` restores zsh's default `fpath` when lmod's exported `FPATH` has
+  replaced it. Without that, `compinit` is missing and startup hangs in Meta's
+  command-not-found handler.
+- Not stowed on Meta: `secrets`, `git` (included from Meta's `~/.gitconfig` via
+  `include.path` so its x509/LFS settings survive), `gh` (on a keyring-less host
+  `gh auth login` would write the token into the tracked `hosts.yml`), `claude`,
+  `codex`, and the macOS-only packages.
 
 ## Components
 

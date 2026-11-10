@@ -16,3 +16,7 @@
 #
 # You can remove these comments if you want or leave
 # them for future reference.
+# Meta devserver: never sync shell history to the Atuin server.
+if ('/usr/facebook/ops/rc/master.zshrc' | path exists) {
+    $env.ATUIN_AUTO_SYNC = 'false'
+}
