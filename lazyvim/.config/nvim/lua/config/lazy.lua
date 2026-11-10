@@ -1,3 +1,14 @@
+-- Meta devserver: no direct internet, so route plugin downloads (lazy.nvim's
+-- git clones, mason/treesitter curl fetches) through fwdproxy. Only affects
+-- nvim and its children; internal hosts stay direct via the inherited no_proxy.
+if (vim.uv or vim.loop).fs_stat("/usr/facebook/ops/rc/master.zshrc") then
+  for _, var in ipairs({ "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY" }) do
+    if not vim.env[var] or vim.env[var] == "" then
+      vim.env[var] = "http://fwdproxy:8080"
+    end
+  end
+end
+
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
 if not (vim.uv or vim.loop).fs_stat(lazypath) then
   local lazyrepo = "https://github.com/folke/lazy.nvim.git"
