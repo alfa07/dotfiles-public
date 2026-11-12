@@ -155,6 +155,9 @@ export PATH="$HOME/go/bin:/usr/local/go/bin:$PATH"
 # Flux
 command -v flux >/dev/null && . <(flux completion zsh)
 
+# Claude Code without permission prompts
+alias yolo='claude --dangerously-skip-permissions'
+
 # Kubernetes
 alias k=kubectl
 fpath=($ZSH/completions $fpath)
