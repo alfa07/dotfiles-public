@@ -152,9 +152,6 @@ fi
 # Go lang
 export PATH="$HOME/go/bin:/usr/local/go/bin:$PATH"
 
-# Flux
-command -v flux >/dev/null && . <(flux completion zsh)
-
 # Claude Code without permission prompts
 alias yolo='claude --dangerously-skip-permissions'
 
@@ -165,6 +162,9 @@ if [[ -e ~/.zfunc ]]; then
   fpath+=~/.zfunc
 fi
 autoload -U compinit && compinit
+
+# Flux (needs compdef, so must come after compinit)
+command -v flux >/dev/null && . <(flux completion zsh)
 
 # alias k=kubectl
 # compdef k=kubectl
