@@ -278,3 +278,12 @@ if [[ -n "$SSH_CONNECTION" ]] && [[ -z "$TMUX" ]]; then
     # SESSION="${LC_TMUX_SESSION:-observe}"
     # tmux new-session -As "$SESSION"
 fi
+
+# PARA workspace configuration
+export PARA_MODE="od"
+export PARA_GDRIVE_LOCAL="$HOME/gdrive"
+export PARA_GDRIVE_REMOTE="secondbrain"
+export PARA_ROOT="$HOME/gdrive"
+
+# Google Drive auto-mount (managed by gdrive-mount plugin)
+{ [ -f ~/.claude/gdrive-mount-scripts/auto-mount.sh ] && source ~/.claude/gdrive-mount-scripts/auto-mount.sh; } &>/dev/null &!
